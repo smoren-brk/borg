@@ -31,15 +31,17 @@ named after the first byte (2 hex digits) of the object name.
 
 .. _store_hash:
 
-Several store objects are content-addressed or carry an integrity checksum: they
-are named by, or have appended, the **store hash** of their content. The store
-hash is the unkeyed 256 bit BLAKE3 hash, see ``store_hash()`` in ``crypto/key.py``.
-It is the same for every repository and independent of the key/encryption mode
+Several store objects are content-addressed: they are named by the **store hash**
+of their content. The store hash is the unkeyed 256 bit BLAKE3 hash, see
+``store_hash()`` in ``crypto/key.py``. It is the same for every repository and independent of the key/encryption mode
 (unlike the chunk id hash, which the key mode selects).
 
 config/
   config
     the repository config (see :ref:`repo_config`), a text object
+  defaults
+    the repository defaults (see :ref:`repo_defaults`), in the key's store object
+    envelope (see below). ``borg repo-create`` always writes it.
   space-reserve.N
     purely random binary data to reserve space, e.g. for disk-full emergencies.
     These objects are created and removed by ``borg repo-space``.
@@ -62,33 +64,34 @@ packs/
 index/
   0000... .. ffff...
     the chunks index (chunk ID -> location within a pack file), stored as a set
-    of immutable, encrypted index fragments. A fragment's name is the
-    hex-encoded store hash of its content.
+    of immutable index fragments, each in the key's store object envelope (see
+    below). A fragment's name is the hex-encoded store hash of the stored envelope.
 
 See :ref:`packs` for the pack file format, the ``index/`` namespace and how
 both are written and compacted.
 
 cache/
   checked-packs
-    repository check results (pack id -> timestamp, result), as a hashtable with an
-    appended integrity hash. Records are kept across checks: ``check --max-age``
-    skips packs whose intact record is younger than the given age, and partial checks
+    repository check results (pack id -> timestamp, result), as a hashtable in the
+    key's store object envelope (see below). Records are kept across checks:
+    ``check --max-age`` skips packs whose intact record is younger than the given age, and partial checks
     (``--max-duration``) verify the least-recently-checked packs first so repeated
-    runs cover the whole repository. Records of corrupt packs are kept for repair and
-    always re-verified. Records of packs no longer listed in packs/ are pruned when a
-    check finishes.
+    runs cover the whole repository. Records of corrupt packs are always re-verified;
+    ``check --repair`` salvages each pack still recorded corrupt (see :ref:`packs`) and
+    records a pack that reads intact at the salvage as intact. Records of packs no longer
+    listed in packs/ are pruned when a check finishes.
   referenced-by-archive.<hex-encoded archive ID>
     what one archive references (object ID -> plaintext object size), plus the file
-    count and content size of that archive, with the store hash appended for integrity.
-    It lets a following ``borg compact`` or ``borg analyze`` skip re-reading the items
-    of an unchanged archive.
+    count and content size of that archive, in the key's store object envelope (see
+    below). It lets a following ``borg compact`` or ``borg analyze`` skip re-reading
+    the items of an unchanged archive.
   chunkindex-invalid
     a marker object: while it is present, the chunks index in ``index/`` is considered
     invalid, because its fragments may be missing entries or point at deleted packs.
     It is written before deleting index fragments, before a single-object delete removes
-    the old pack, and before ``borg check --repair`` rebuilds the index after changing
-    the packs. It is removed after the last fragment is deleted or once the complete
-    current index is stored.
+    the old pack, by ``borg check --repair`` after storing packs, before it re-reads
+    them and stores the index, and before the first pack a salvage deletes. It is removed
+    after the last fragment is deleted or once the complete current index is stored.
 
 Note that this ``cache/`` namespace is inside the repository (and thus shared by
 all clients); it is not the client-local cache described in
@@ -106,7 +109,34 @@ keys/
 
 locks/
   used by the locking system to manage shared and exclusive locks, see
-  :ref:`storelocking`.
+  :ref:`storelocking`. The lock objects are stored in the store object envelope
+  (see below).
+
+.. _store_object_envelope:
+
+The index fragments, the lock objects, ``checked-packs``, the
+``referenced-by-archive.*`` objects and ``config/defaults`` are stored in the **store object envelope**: the repository key's ``encrypt()``,
+exactly as for the metadata and data slots of the objects in a pack (see
+:ref:`security_encryption`), with an empty id and an AAD of
+``b"borg-store-object\0"`` followed by the repository id, the tag ``b"n"`` and the
+object name. For the index fragments and the lock objects, whose name is the store hash
+of the envelope and does not exist before it, the AAD holds the tag ``b"h"`` and the
+namespace (``index`` or ``locks``) instead: the tags keep a namespace and an object of the same name apart. So these
+objects are protected like the objects in the packs: encrypted and authenticated in
+the encrypting modes, authenticated only in the ``authenticated-*`` modes. The AAD
+binds an object to its repository and name: an object copied to another name, or
+from another repository using the same key material, fails the authentication.
+Reading or writing them needs the key (``Repository.set_key()``); an object that
+fails the authentication is treated like a corrupted one: ``borg check`` reports a
+corrupt index fragment and ``borg check --repair`` rebuilds the chunks index from the
+packs; any other command that needs the chunks index aborts, except ``borg compact``
+and ``borg repo-compress``, which rebuild it from the packs, as they rewrite the whole
+chunks index anyway (under an exclusive lock). A corrupted cache is ignored and
+rebuilt. A lock object that fails the authentication is treated as a foreign exclusive
+lock, see :ref:`storelocking`. The commands that use ``config/defaults`` abort if it is
+missing or fails the authentication, ``borg check --repair`` replaces it by empty defaults
+(see :ref:`repo_defaults`). The ``chunkindex-invalid`` marker has no content and is
+stored as is.
 
 
 Keys
@@ -202,10 +232,13 @@ Compaction
 - free space one pack file at a time - a single object can not be removed from
   a pack file, only a whole pack file can be deleted or rewritten:
 
-  - a pack file whose indexed objects are all unused is deleted
-  - a pack file with some unused objects is rewritten without them, but only if
-    the wasted bytes reach the ``--threshold`` percentage
+  - a pack file holding only unused objects and superseded duplicates (copies of
+    chunks the chunks index records at another location) is deleted
+  - a pack file with some unused objects or superseded duplicates is rewritten
+    without them, but only if their bytes reach the ``--threshold`` percentage
   - very small pack files are merged into bigger ones
+  - a pack file recorded corrupt by ``borg check`` is not rewritten or merged,
+    it is only deleted if its indexed objects are all unused
 - update the chunks index in ``index/`` accordingly
 - with ``--stats``, compute statistics about:
 
@@ -264,7 +297,9 @@ entries are present, or none: a repository created via the Python API
 store, but borg refuses to load a key for it.
 
 ``borg repo-create`` writes the config once, after the key was created: writing
-it is what makes the store a repository. A store without it (e.g. the leftover of
+it is what makes the store a repository. It then writes an empty chunks index
+(which needs the key), so the first use of the repository does not have to build
+it by listing the packs. A store without the config (e.g. the leftover of
 an interrupted ``borg repo-create``) is not a repository: borg reports it as not
 a valid repository, and ``borg repo-create`` refuses to create a repository in a
 non-empty location, saying whether it found a repository config there.
@@ -279,6 +314,41 @@ is 5, the id is in the key (the ``BORG_KEY <id>`` header line of a keyfile or of
 a ``keys/`` object, see :ref:`key_files`), and the encryption mode and id hash
 are what ``borg repo-create`` was given (the key type byte of any repository
 object encodes them as well, see ``KeyType`` in ``constants.py``).
+
+.. _repo_defaults:
+
+Repository defaults
+~~~~~~~~~~~~~~~~~~~
+
+The ``config/defaults`` store object holds default values for command options,
+as a msgpacked dict mapping the option name to its value, both as strings::
+
+    {"compression": "zstd,3", "chunker_params": "fastcdc,19,23,21,2"}
+
+*compression* is the default compression spec (see ``borg help compression``),
+set by ``borg repo-create --compression``. The commands with a ``--compression``
+option use it if no compression was given via the command line, the environment or
+the default config file; without it, they use lz4.
+
+*chunker_params* are the default :ref:`chunker-params <chunker-params>`, set by
+``borg repo-create --chunker-params``. ``borg create`` and ``borg import-tar`` use
+them if no chunker params were given (in the same ways as above), ``borg recreate``
+and ``borg transfer`` for ``--chunker-params default``; without them, the built-in
+default chunker params are used.
+
+Each entry is optional, a missing entry means that the repository has no default
+for it.
+
+Unlike the repository config, which borg must read before it knows the key, the
+defaults are stored in the :ref:`store object envelope <store_object_envelope>`,
+so they are authenticated: an attacker with write access to the storage can not
+change them (e.g. remove an ``obfuscate`` compression) without being noticed.
+``borg repo-create`` always writes the object, also when no default was given (an
+empty dict), so removing it is noticed as well: the commands that use the defaults
+refuse to run if the object is missing or fails the authentication. ``borg check``
+reports such an object and ``borg check --repair`` replaces it by empty defaults, so
+the repository can be used again (with the built-in defaults). Like the repository
+config, the defaults themselves can not be restored.
 
 .. _archive:
 
@@ -1127,6 +1197,14 @@ locked.
 
 To implement locking based on ``borgstore``, borg stores objects below locks/.
 
+The objects are stored in the :ref:`store object envelope <store_object_envelope>`,
+so locking the repository needs the key: borg loads it (and asks for the passphrase,
+if needed) before it waits for the lock. A lock object is named by the store hash of
+its envelope, so neither its content nor its name tells who uses the repository. Every
+lock object is encrypted in a fresh one-off session (a new random session id), because
+a lock may be refreshed by a background thread while the main thread encrypts other
+objects.
+
 The objects contain:
 
 - a timestamp when lock was created (or refreshed), stamped by the clock of
@@ -1137,6 +1215,22 @@ The objects contain:
 Where the storage backend provides object timestamps (file, sftp, s3 and
 current rest servers - but not rclone), borg additionally uses the lock
 object's store-side mtime, which is stamped by the storage's clock.
+
+To acquire a lock, borg lists the lock objects, creates its own lock object if
+nothing forbids it, waits for the race recheck delay and lists again, to detect
+other clients that created theirs at the same time (if so, it backs off and
+retries). This needs storage with list-after-write consistency: a listing started
+after a lock object was written must contain it. Then, of two clients racing for
+the lock, at least the one that created its lock object last sees the other's, so
+they can not both get an exclusive lock. Local filesystems, sftp, rest
+(``borg serve --rest``) and S3 as provided by AWS or MinIO give this guarantee and
+the default delay (0.01s) is fine.
+
+If the storage only lists a new object after a lag (e.g. NFS clients caching
+directory listings, or some cloud storages used via rclone), set
+``BORG_LOCK_RECHECK_DELAY`` to at least that lag (in seconds) on all clients
+using the repository: then, the client that created its lock object last still
+sees the other one.
 
 Using that information, borg implements:
 
@@ -1154,6 +1248,12 @@ Using that information, borg implements:
   a few minutes.
 - telling the user which lock blocks them (type, host, pid, age) while waiting
   for it and in the error message if acquiring it times out.
+- a lock object that can not be read (it fails the authentication, e.g. because it
+  is corrupt or was not written by a borg with the repository's key) is treated as
+  a foreign exclusive lock: nothing is known about it but its store-side mtime, so it
+  only expires if the storage's clock confirms that it was not written for longer
+  than the stale timeout. Without store-side mtimes, it never expires; then
+  ``borg break-lock`` removes it.
 
 See the module docstring of ``src/borg/storelocking.py`` for the details
 (clock domains, how store "now" is derived, what happens without store-side
@@ -1163,8 +1263,8 @@ Breaking the lock
 -----------------
 
 In case you run into troubles with the repository lock, you can use the
-``borg break-lock`` command after you first have made sure that no Borg process
-is running on any machine that accesses this repository. Be very careful, the
+``borg break-lock`` command (it needs the key) after you first have made sure that
+no Borg process is running on any machine that accesses this repository. Be very careful, the
 repository might get damaged if multiple processes write to it at the same time.
 
 Usually you do not need this: a stale lock resolves automatically (see above),

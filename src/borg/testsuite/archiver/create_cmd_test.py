@@ -739,6 +739,15 @@ def test_progress_on(archivers, request):
     assert "0 B O 0 B U 0 N" in output
 
 
+def test_progress_chunk_index_loaded_first(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    create_regular_file(archiver.input_path, "file1", size=1024 * 80)
+    cmd(archiver, "repo-create", RK_ENCRYPTION)
+    cmd(archiver, "create", "test1", "input")  # writes a chunk index fragment
+    output = cmd(archiver, "create", "test2", "input", "--progress")
+    assert output.index("Loading chunk index 100%") < output.index("0 B O 0 B U 0 N")
+
+
 def test_progress_off(archivers, request):
     archiver = request.getfixturevalue(archivers)
     create_regular_file(archiver.input_path, "file1", size=1024 * 80)
@@ -770,7 +779,7 @@ def test_create_tags(archivers, request):
     archiver = request.getfixturevalue(archivers)
     create_test_files(archiver.input_path)
     cmd(archiver, "repo-create", RK_ENCRYPTION)
-    cmd(archiver, "create", "--tags", "foo", "bar", "baz", "--", "test", "input")
+    cmd(archiver, "create", "--tag", "foo", "--tag", "bar", "--tag", "baz", "test", "input")
     info = cmd(archiver, "info", "--json", "test")
     info = json.loads(info)
     assert sorted(info["archives"][0]["tags"]) == ["bar", "baz", "foo"]
@@ -780,7 +789,7 @@ def test_create_invalid_tags(archivers, request):
     archiver = request.getfixturevalue(archivers)
     create_test_files(archiver.input_path)
     cmd(archiver, "repo-create", RK_ENCRYPTION)
-    output = cmd(archiver, "create", "--tags", "@INVALID", "--", "test", "input", exit_code=EXIT_ERROR)
+    output = cmd(archiver, "create", "--tag", "@INVALID", "test", "input", exit_code=EXIT_ERROR)
     assert "Unknown special tags given" in output
 
 

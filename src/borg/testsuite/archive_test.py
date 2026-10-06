@@ -1,5 +1,6 @@
 import json
 import os
+import random
 from collections import OrderedDict
 from datetime import datetime, timezone
 from io import StringIO
@@ -7,18 +8,19 @@ from unittest.mock import Mock
 
 import pytest
 
-from . import rejected_dotdot_paths, is_utime_fully_supported, make_test_key
+from . import rejected_dotdot_paths, is_utime_fully_supported, make_test_key, set_test_key_on_open
 from ..cache import ChunkListEntry
-from ..constants import ROBJ_FILE_STREAM, zeros
+from ..constants import ROBJ_ARCHIVE_STREAM, ROBJ_FILE_STREAM, zeros
 from ..archive import Archive, CacheChunkBuffer, DownloadPipeline, RobustUnpacker, valid_msgpacked_dict
 from ..archive import ITEM_KEYS, Statistics
 from ..archive import zero_chunk_flags, zero_chunk_id, zero_chunk_ids
 from ..archive import BackupOSError, BackupRaceConditionError, backup_io, backup_io_iter, get_item_uid_gid
 from ..archive import stat_update_check
-from ..helpers import msgpack
+from ..helpers import msgpack, StableDict
 from ..repoobj import RepoObj
 from ..item import Item, ArchiveItem
 from ..manifest import Archives, Manifest
+from ..repository import Repository
 from ..platform import uid2user, gid2group, is_win32
 
 
@@ -353,6 +355,41 @@ def test_download_pipeline_zero_chunks_served_locally():
     assert repository.requested_ids == [other_id]
 
 
+def test_download_pipeline_item_stream_reads_ranges(tmp_path, monkeypatch):
+    # item metadata chunks share packs with file content chunks: reading an archive's items gathers just
+    # their byte ranges, while file content is still read by loading the whole pack.
+    set_test_key_on_open(monkeypatch)  # the index/ objects need a key, see Repository.set_key
+    key = make_test_key(None)
+    repo_objs = RepoObj(key)
+    items = [Item(path=f"file{i}", mode=0o100644) for i in range(3)]
+    stream = b"".join(msgpack.packb(item.as_dict()) for item in items)
+    item_chunks = [stream[:20], stream[20:]]
+    content = os.urandom(10000)
+    with Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True) as repository:
+        content_id = repo_objs.id_hash(content)
+        repository.put(content_id, repo_objs.format(content_id, {}, content, ro_type=ROBJ_FILE_STREAM))
+        item_ids = []
+        for data in item_chunks:
+            item_id = repo_objs.id_hash(data)
+            repository.put(item_id, repo_objs.format(item_id, {}, data, ro_type=ROBJ_ARCHIVE_STREAM))
+            item_ids.append(item_id)
+        repository.flush()
+        assert len({repository.chunks[id].pack_id for id in item_ids + [content_id]}) == 1  # all in one pack
+        pipeline = DownloadPipeline(repository, repo_objs)
+
+        loads_before, gathers_before = repository.store.stats["load_calls"], repository.store.stats["gather_calls"]
+        assert [item.path for item in pipeline.unpack_many(item_ids)] == [item.path for item in items]
+        assert repository.store.stats["gather_calls"] - gathers_before == 1
+        assert repository.store.stats["load_calls"] == loads_before  # no whole-pack load
+
+        loads_before = repository.store.stats["load_calls"]
+        assert list(pipeline.fetch_many([ChunkListEntry(content_id, len(content))], ro_type=ROBJ_FILE_STREAM)) == [
+            content
+        ]
+        assert repository.store.stats["load_calls"] - loads_before == 1  # the whole pack
+        assert len(repository._pack_cache) == 1
+
+
 def test_zero_chunk_flags():
     # cheap all-zero chunk detection from the chunk ids/sizes alone: the zero chunk id
     # is computed for ids occurring repeatedly, while unique ids are only compared
@@ -486,6 +523,106 @@ def test_resync_on_item_with_unknown_first_key():
     unpacker.resync()
     unpacker.feed(b"\x00\xff\xc1garbage" + msgpack.packb(item) + make_chunks(["bar"]))
     assert list(unpacker) == [item, {"path": "bar"}]
+
+
+def feed_and_unpack(unpacker, pieces):
+    result = []
+    for data in pieces:
+        unpacker.feed(data)
+        result.extend(unpacker)
+    return result
+
+
+def test_resync_item_header_split_across_feeds():
+    unpacker = RobustUnpacker(validator=_validator)
+    unpacker.resync()
+    data = b"garbage" + make_chunks(["foo", "bar"])
+    assert feed_and_unpack(unpacker, split(data, 1)) == [{"path": "foo"}, {"path": "bar"}]
+
+
+def test_resync_item_spanning_feeds():
+    item = {"acl_access": b"x" * 1000, "path": "foo"}
+    unpacker = RobustUnpacker(validator=_validator)
+    unpacker.resync()
+    data = b"garbage" + msgpack.packb(item) + make_chunks(["bar"])
+    assert feed_and_unpack(unpacker, split(data, 16)) == [item, {"path": "bar"}]
+
+
+def test_resync_item_with_long_chunk_list_spanning_feeds():
+    # the chunks array header declares more elements than bytes are fed when the item start is tried.
+    item = {"chunks": [[bytes(32), 1000]] * 1000, "path": "foo"}
+    unpacker = RobustUnpacker(validator=_validator)
+    unpacker.resync()
+    data = b"garbage" + msgpack.packb(item) + make_chunks(["bar"])
+    assert feed_and_unpack(unpacker, split(data, 16)) == [item, {"path": "bar"}]
+
+
+def test_resync_forgets_long_incomplete_item():
+    item = {"acl_access": b"x" * 1000, "path": "foo"}
+    unpacker = RobustUnpacker(validator=_validator)
+    unpacker.MAX_PENDING_ITEM_LEN = 500
+    unpacker.resync()
+    data = msgpack.packb(item) + make_chunks(["bar"])
+    assert feed_and_unpack(unpacker, split(data, 16)) == [{"path": "bar"}]
+
+
+def test_resync_skipping_chunk_list_keeps_buffer_small():
+    # the chunk ids in a msgpacked chunk list form incomplete item starts, but no item start.
+    rng = random.Random(0)
+    chunk_list = msgpack.packb([[rng.randbytes(32), rng.randrange(1 << 21)] for _ in range(25000)])
+    unpacker = RobustUnpacker(validator=_validator)
+    unpacker.MAX_PENDING_ITEM_LEN = 64 * 1024
+    unpacker.resync()
+    for data in split(chunk_list, 16 * 1024):
+        unpacker.feed(data)
+        assert list(unpacker) == []
+        assert len(unpacker._buffered_data) <= unpacker.MAX_PENDING_ITEM_LEN
+    unpacker.feed(make_chunks(["foo", "bar"]))
+    assert list(unpacker) == [{"path": "foo"}, {"path": "bar"}]
+
+
+def reference_resync_unpack(pieces):
+    """Return the items RobustUnpacker returns for <pieces> after resync(), searching all fed data after each piece."""
+    result, buffered, unpacker = [], b"", None
+    for piece in pieces:
+        if unpacker is not None:
+            unpacker.feed(piece)
+            result.extend(unpacker)
+            continue
+        buffered += piece
+        for offset in range(len(buffered)):
+            if not valid_msgpacked_dict(buffered[offset:]):
+                continue
+            unpacker = msgpack.Unpacker(object_hook=StableDict)
+            unpacker.feed(buffered[offset:])
+            try:
+                item = next(unpacker)
+            except (msgpack.UnpackException, StopIteration):
+                continue
+            if _validator(item):
+                result.append(item)
+                result.extend(unpacker)
+                break
+        else:
+            unpacker = None
+    return result
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_resync_like_reference(seed):
+    rng = random.Random(seed)
+    for _ in range(100):
+        items = []
+        for _ in range(rng.randrange(1, 10)):
+            item = {"path": rng.choice(["foo", "bar", "boo", "baz"]), "mode": rng.randrange(1 << 16)}
+            if rng.random() < 0.5:
+                item["chunks"] = [[rng.randbytes(32), rng.randrange(1 << 21)] for _ in range(rng.randrange(20))]
+            items.append(dict(sorted(item.items())))
+        data = rng.randbytes(rng.randrange(20)) + b"".join(msgpack.packb(item) for item in items)
+        pieces = split(data, rng.choice([1, 3, 50, 300]))
+        unpacker = RobustUnpacker(validator=_validator)
+        unpacker.resync()
+        assert feed_and_unpack(unpacker, pieces) == reference_resync_unpack(pieces)
 
 
 def test_backup_io():

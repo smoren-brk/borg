@@ -20,15 +20,11 @@ try:
 except:  # noqa
     raises = None
 
-from ..fuse_impl import llfuse, has_any_fuse, has_llfuse, has_pyfuse3, has_mfusepy, ENOATTR  # NOQA
 from .. import platform
 
 # import these directly: the borg.testsuite.platform subpackage shadows the platform name above.
-from ..platform import get_birthtime_ns, set_times
+from ..platform import get_birthtime_ns, set_times, ENOATTR  # NOQA
 from ..platformflags import is_win32, is_darwin
-
-# Does this version of llfuse support ns precision?
-have_fuse_mtime_ns = hasattr(llfuse.EntryAttributes, "st_mtime_ns") if llfuse else False
 
 has_mknod = hasattr(os, "mknod")
 
@@ -269,6 +265,25 @@ def filter_xattrs(x):
     if isinstance(x, list):
         return [k for k in x if k not in UNWANTED_KEYS]
     raise ValueError("Unsupported type: %s" % type(x))
+
+
+def set_test_key_on_open(monkeypatch):
+    """Make every Repository opened in a test use make_test_key() for its lock, index/ and cache/ objects.
+
+    The test key is only set if the repository has no key yet. It is set before the repository gets
+    opened, as locking it needs the key already (see Repository.acquire_lock). A real key set later
+    via set_key() replaces it.
+    """
+    from ..repository import Repository
+
+    original_open = Repository.open
+
+    def open(self, *args, **kwargs):
+        if self.key is None:
+            self.set_key(make_test_key(self))
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Repository, "open", open)
 
 
 def make_test_key(repository=None):

@@ -136,6 +136,10 @@ CHUNKINDEX_SMALL_FRAGMENT_CAP = 15
 # How often to restart merging the fragments into a chunk index when a listed fragment vanishes
 # mid-merge (a concurrent repack replaced it). After that, fall back to the slow rebuild from packs.
 CHUNKINDEX_MERGE_ATTEMPTS = 3
+# ChunkIndex.iter_packs() holds at most this many entries at a time, 8 bytes each (~16 bytes including
+# the array growth slack) plus ~150 bytes per pack for the grouping, and does one full scan of the chunk
+# index per max_entries entries it contains.
+CHUNKINDEX_ITER_PACKS_ENTRIES_MAX = 1000000  # ~16MB
 # Marker object in the cache/ namespace: the chunk index is invalid. While it is present, the index/ fragments
 # may be missing entries or point at deleted packs, so the chunk index is rebuilt from the packs on next load
 # and the leftover fragments are deleted.
@@ -182,6 +186,13 @@ GOLDILOCKS_AES_PARAMS = (CH_GOLDILOCKS_AES, CHUNK_MIN_EXP, CHUNK_MAX_EXP, HASH_M
 # toeplitz-aes: same param shape as rabin-aes (fixed 64-byte window).
 TOEPLITZ_AES_PARAMS = (CH_TOEPLITZ_AES, CHUNK_MIN_EXP, CHUNK_MAX_EXP, HASH_MASK_BITS, NC_LEVEL)
 CHUNKER_PARAMS = FASTCDC_PARAMS  # the default chunker for file content data
+
+# the compression used if neither --compression nor the repository default (see repo-create) gives one
+BUILTIN_COMPRESSION = "lz4"
+
+# what ChunkerParams returns for "--chunker-params default": the repository default (see repo-create) if it
+# has one, else CHUNKER_PARAMS. with_repository replaces it by the real chunker params.
+DEFAULT_CHUNKER_PARAMS = ("default",)
 
 # chunker params for the items metadata stream, finer granularity
 ITEMS_CHUNKER_PARAMS = (CH_FASTCDC, 15, 19, 17, NC_LEVEL)

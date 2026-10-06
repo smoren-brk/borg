@@ -1,3 +1,4 @@
+from array import array
 from collections import defaultdict
 from pathlib import Path
 
@@ -12,10 +13,11 @@ from ..helpers import get_cache_dir
 from ..helpers.argparsing import ArgumentParser
 from ..constants import *  # NOQA
 from ..hashindex import ChunkIndex
-from ..helpers import set_ec, EXIT_ERROR, Error, sig_int, format_file_size, bin_to_hex, hex_to_bin, IntegrityError
-from ..helpers import ProgressIndicatorPercent
+from ..helpers import set_ec, EXIT_ERROR, EXIT_WARNING, Error, sig_int, format_file_size, bin_to_hex, hex_to_bin
+from ..helpers import IntegrityError, ProgressIndicatorPercent
 from ..repoobj import object_validator
-from ..repository import Repository
+from ..repository import Repository, PackReader, PackTracker
+from ..repository import check_pack_objects, decode_ranges, superseded_gap_ranges
 
 from ..logger import create_logger
 
@@ -242,41 +244,92 @@ class ArchiveGarbageCollector:
         for archive_info in self.manifest.archives.list(sort_by=["ts"], deleted=True):
             name, hex_id = archive_info.name, bin_to_hex(archive_info.id)
             try:
-                archive = Archive(self.manifest, archive_info.id, deleted=True)
+                archive = Archive(self.manifest, archive_info, deleted=True)
                 missing = sum(not self._mark_object_used(id) for id in self._archive_object_ids(archive))
                 if missing:
                     logger.warning(
                         f"Soft-deleted archive {name} {hex_id}: {missing} objects missing from the index; "
                         f'"borg undelete" may not fully recover it.'
                     )
-            except (Repository.ObjectNotFound, IntegrityError) as e:
+            except (Archive.DoesNotExist, Repository.ObjectNotFound, IntegrityError) as e:
                 logger.warning(f"Soft-deleted archive {name} {hex_id} cannot be fully preserved: {e}")
+
+    def superseded_duplicates(self, gap_ranges, pack_total, validate, untrusted_pack_ids):
+        """Return pack_id -> the ranges of the superseded duplicates in that pack, for the packs holding any.
+
+        gap_ranges: pack_id -> the offset-ordered ranges of the pack's index entries, for the packs to walk.
+        pack_total: pack_id -> file size in the store.
+        validate, untrusted_pack_ids: passed to superseded_gap_ranges, which defines gaps and superseded
+            duplicates.
+
+        The ranges are arrays of encoded byte ranges, see decode_ranges.
+
+        Ctrl-C stops the walk at a pack boundary.
+        """
+        superseded = {}
+        pi = ProgressIndicatorPercent(
+            total=len(gap_ranges), msg="Reading unindexed pack data %3.0f%%", msgid="compact.superseded_duplicates"
+        )
+        for pid, ranges in gap_ranges.items():
+            if sig_int:
+                break
+            pi.show()
+            # PackReader reads from the store, which does not refresh the repository lock.
+            self.repository._lock_refresh()
+            reader = PackReader(store=self.repository.store, pack_id=pid)
+            drop_ranges = superseded_gap_ranges(
+                reader,
+                self.chunks,
+                pid,
+                decode_ranges(ranges),
+                pack_total[pid],
+                validate=validate,
+                untrusted_pack_ids=untrusted_pack_ids,
+            )
+            if drop_ranges:
+                superseded[pid] = array("Q", (offset << 32 | size for offset, size in drop_ranges))
+        pi.finish()
+        return superseded
 
     def compact_packs(self):
         """Free space one pack at a time (the store can only delete whole packs).
 
-        analyze_archives() has flagged the used objects F_USED. Only indexed-but-unused bytes are
-        reclaimed; bytes no index entry covers are preserved (see below). Per pack:
+        analyze_archives() has flagged the used objects F_USED. A pack's reclaimable bytes are its
+        indexed-but-unused bytes plus its superseded duplicates (see superseded_gap_ranges); other bytes
+        no index entry covers are preserved (see below). Per pack:
 
-        - all indexed objects unused, whole file indexed -> delete the pack.
-        - some indexed objects unused                    -> rewrite if the unused bytes reach
-                                --threshold percent: copy the used objects (and any unindexed bytes)
-                                into a new pack via compact_pack and drop the old one. Below the
+        - no indexed objects used, all bytes reclaimable -> delete the pack.
+        - some bytes reclaimable                         -> rewrite if the reclaimable bytes reach
+                                --threshold percent: copy the used objects (and the other unindexed
+                                bytes) into a new pack via compact_pack and drop the old one. Below the
                                 threshold keep the pack, so we don't rewrite a large pack to reclaim
                                 little.
-        - no indexed objects unused                      -> keep it, unless it is a tiny pack we
+        - no bytes reclaimable                           -> keep it, unless it is a tiny pack we
                                 merge (see below).
 
+        A tiny pack without unused indexed objects is also a merge candidate when its superseded
+        duplicates make it a delete or rewrite candidate, but the all-packs gate cancels that.
+
+        A pack in which the index lists overlapping objects or an object past the end of the pack is
+        logged as an error and kept unchanged.
+
+        A pack recorded corrupt in PackTracker is dropped if all its bytes are indexed and unused,
+        otherwise kept unchanged: a pack's id is the hash of its content, so a rewritten or merged copy
+        of the corrupt bytes would get a new id that passes "borg check".
+
         A pack can hold bytes no index entry covers (a chunk copy stored again elsewhere, or objects
-        from a backup that crashed before writing its index). compact_pack keeps those; recovering or
-        dropping them is "borg check --repair"'s job. See issue #9868.
+        from a backup that crashed before writing its index). Except for the superseded duplicates,
+        compact keeps those; recovering or dropping them is "borg check --repair"'s job. See issue #9868.
 
         Compacting anything rewrites the whole chunk index and invalidates every client's cached
         copy, so compact only when the reclaimable space or the combined size of tiny packs is worth
         that cost.
 
-        Two passes bound the memory use: the first keeps only per-pack byte counts to pick the packs
-        to change, the second collects object ids for just those packs, not the whole index.
+        Two passes bound the memory use: the first keeps per-pack byte counts and the byte range of
+        each index entry as one int (see decode_ranges) to pick the packs to change, the second collects
+        object ids for just those packs, not the whole index. The first pass also walks the gaps of the
+        packs that have any (superseded_duplicates). The rewrites drop the superseded duplicates that
+        walk found.
 
         A pack's size is the file size the store reports, so it also counts bytes no index entry covers.
 
@@ -294,73 +347,110 @@ class ArchiveGarbageCollector:
         # detect which packs hold unindexed bytes. collect index entries whose pack is not in the store.
         pack_used = defaultdict(int)
         pack_indexed = defaultdict(int)  # pack_id -> bytes of all its index entries, used or not
+        pack_ranges = {pid: array("Q") for pid in pack_total}  # pack_id -> byte ranges of all its index entries
         stale_ids = []  # index entries referencing a pack file that is not in the store
+        stale_packs = set()  # ids of the pack files that are not in the store
         stale_used = 0  # how many of those were still flagged used (lost data)
         for id, entry in self.chunks.iteritems():
             pid = entry.pack_id
             if pid not in pack_total:
                 stale_ids.append(id)
+                stale_packs.add(pid)
                 if entry.flags & ChunkIndex.F_USED:
                     stale_used += 1
             else:
                 pack_indexed[pid] += entry.obj_size
+                pack_ranges[pid].append(entry.obj_offset << 32 | entry.obj_size)
                 if entry.flags & ChunkIndex.F_USED:
                     pack_used[pid] += entry.obj_size
 
         if stale_ids:
-            # keep these entries: they may be an archive's only pointer to a chunk. dropping them
-            # (repairing the index) is not implemented yet, refs #8572.
+            # stale entries reference a pack absent from the store. they are kept, borg check --repair removes them.
             n = len(stale_ids)
             logger.warning(
-                f"index entries referencing a missing pack file: {n}. Repairing the index "
-                "(dropping the stale references) is tracked in https://github.com/borgbackup/borg/issues/8572."
+                f'index entries referencing a missing pack file: {n}. Run "borg check --repair" to remove them.'
             )
             if stale_used:
                 logger.error(f"{stale_used} of them are still in use: repository data is missing!")
                 set_ec(EXIT_ERROR)
 
-        # bytes no index entry covers. compact_pack reclaims the redundant duplicates among them while
-        # rewriting a pack; reclaiming the rest is tracked in #8572.
+        # packs recorded corrupt in PackTracker that are still in the store
+        corrupt_packs = set(PackTracker.load(self.repository).corrupt_ids()) & pack_total.keys()
+
+        # check the index entries of each pack against its file size.
+        inconsistent_packs = set()  # ids of the packs whose index entries overlap or reach past the end of the file
+        gap_ranges = {}  # pack_id -> offset-ordered byte ranges of its index entries, for the packs to walk
+        for pid, total in pack_total.items():
+            ranges = array("Q", sorted(pack_ranges.pop(pid)))
+            try:
+                check_pack_objects(bin_to_hex(pid), decode_ranges(ranges), total)
+            except IntegrityError as err:
+                logger.error(str(err))
+                set_ec(EXIT_ERROR)
+                inconsistent_packs.add(pid)
+            else:
+                # corrupt packs are not rewritten or merged, so their gaps are not walked.
+                if total > pack_indexed[pid] and pid not in corrupt_packs:
+                    gap_ranges[pid] = ranges
+
+        validate = object_validator(self.manifest.repo_objs)
+        untrusted_pack_ids = stale_packs | corrupt_packs | inconsistent_packs
+        # pack_id -> byte ranges of its superseded duplicates
+        pack_superseded = self.superseded_duplicates(gap_ranges, pack_total, validate, untrusted_pack_ids)
+        del gap_ranges
+        if sig_int:
+            return repo_size_before, repo_size_before  # Ctrl-C during the walk, nothing was changed
+        superseded_bytes = {pid: sum(r & 0xFFFFFFFF for r in ranges) for pid, ranges in pack_superseded.items()}
+
+        # unindexed bytes: pack bytes no index entry covers, e.g. the objects of an interrupted borg create.
+        # compact reclaims the superseded duplicates among them and keeps the other unindexed objects, as
+        # "borg check --repair" can recover them (#9868). A full check --repair (--repository-only rebuilds
+        # the index only if it is corrupt) indexes one copy per chunk id, so objects whose chunk id had no
+        # index entry become reclaimable once unused, and the other copies become superseded duplicates.
         unindexed = sum(total - pack_indexed[pid] for pid, total in pack_total.items() if total > pack_indexed[pid])
+        unindexed -= sum(superseded_bytes.values())
         if unindexed:
             logger.info(
-                f"{format_file_size(unindexed)} in pack files is not covered by the index; "
-                "redundant copies are reclaimed on pack rewrite, reclaiming the rest is tracked in "
-                "https://github.com/borgbackup/borg/issues/8572."
+                f"{format_file_size(unindexed)} in pack files is not covered by the index. "
+                '"borg check --repair" (without --repository-only) indexes the objects whose chunk id has no '
+                'index entry, so "borg compact" reclaims them once unused.'
             )
 
-        # decide each pack's fate. a pack's reclaimable bytes are its indexed-but-unused bytes; the
-        # redundant duplicates compact_pack finds in the gaps are reclaimed on top when it rewrites.
+        # decide each pack's fate.
         # a merge fills packs up to pack_max_size, so cap "tiny" at half of that: a merged full pack
         # is then at least twice tiny_limit and no longer a merge candidate.
         tiny_limit = min(MIN_PACK_SIZE, self.repository.pack_max_size // 2)
         drop_packs, rewrite_packs, merge_packs = set(), set(), set()
+        tiny_reclaim_packs = set()  # tiny drop or rewrite candidates without unused indexed bytes
         pack_reclaim = {}  # pack_id -> reclaimable bytes, for the packs we act on (drop or rewrite)
         for pid, total in pack_total.items():
             indexed = pack_indexed[pid]
             used = pack_used[pid]
-            if indexed > total:
-                # the index lists more bytes than the file holds.
-                logger.error(f'Pack {bin_to_hex(pid)}: index claims more data than the file holds, run "borg check".')
-                set_ec(EXIT_ERROR)
+            if pid in inconsistent_packs:
                 continue  # leave this pack untouched
-            reclaimable = indexed - used  # unused indexed bytes; the only bytes compact removes
-            if reclaimable == 0:
-                if used == indexed and total < tiny_limit:
-                    merge_packs.add(pid)  # fully-used but tiny -> merge candidate
-                continue  # nothing to reclaim -> leave alone
-            if used == 0 and indexed == total:
-                drop_packs.add(pid)  # whole file is unused indexed bytes -> drop it
+            unused = indexed - used  # unused indexed bytes
+            superseded = superseded_bytes.get(pid, 0)
+            reclaimable = unused + superseded  # the only bytes compact removes
+            if reclaimable and used == 0 and indexed + superseded == total:
+                drop_packs.add(pid)  # whole file is unused indexed bytes and superseded duplicates -> drop it
                 pack_reclaim[pid] = reclaimable
-            elif 100 * reclaimable / total >= self.threshold:
-                rewrite_packs.add(pid)  # wasteful enough -> copy used objects (and unindexed bytes) forward
+            elif reclaimable and 100 * reclaimable / total >= self.threshold and pid not in corrupt_packs:
+                rewrite_packs.add(pid)  # wasteful enough -> copy used objects (and other unindexed bytes) forward
                 pack_reclaim[pid] = reclaimable
+            elif unused == 0 and total < tiny_limit and pid not in corrupt_packs:
+                merge_packs.add(pid)  # fully-used but tiny -> merge candidate
             # else: below threshold -> leave alone
+            if pid in pack_reclaim and unused == 0 and total < tiny_limit and pid not in corrupt_packs:
+                tiny_reclaim_packs.add(pid)
 
         # all-packs gate: drop/rewrite only when the space they free reaches threshold/5 percent of
         # all pack bytes; freeing less does not justify the whole-index rewrite.
         reclaimable_total = sum(pack_reclaim.values())
         worth_reclaiming = repo_size_before > 0 and 100 * reclaimable_total / repo_size_before >= self.threshold / 5
+        if not worth_reclaiming:
+            # the tiny packs that are not dropped or rewritten for their superseded duplicates are merge candidates.
+            drop_packs, rewrite_packs, pack_reclaim = set(), set(), {}
+            merge_packs |= tiny_reclaim_packs
         # merge only once the tiny packs' combined size reaches a full pack, so every merge produces
         # at least one pack too large to ever be a merge candidate again. merging smaller amounts
         # would just repack a still-tiny pile into a slightly-bigger-but-still-tiny pack, and each
@@ -368,10 +458,18 @@ class ArchiveGarbageCollector:
         tiny_total = sum(pack_total[pid] for pid in merge_packs)
         worth_merging = tiny_total >= self.repository.pack_max_size
 
-        if not worth_reclaiming:
-            drop_packs, rewrite_packs, pack_reclaim = set(), set(), {}
         if not worth_merging:
             merge_packs = set()
+
+        kept_corrupt = corrupt_packs - drop_packs
+        if kept_corrupt:
+            logger.warning(
+                f'{len(kept_corrupt)} pack(s) recorded corrupt by "borg check" are not rewritten or merged. '
+                'Run "borg check --repair" to salvage them.'
+            )
+            for pid in sorted(kept_corrupt):
+                logger.debug(f"Corrupt pack: {bin_to_hex(pid)}")
+            set_ec(EXIT_WARNING)
 
         if self.dry_run:
             freed = sum(pack_reclaim.values())
@@ -382,7 +480,7 @@ class ArchiveGarbageCollector:
             return repo_size_before, repo_size_before  # dry run: report only, change nothing
 
         if not drop_packs and not rewrite_packs and not merge_packs:
-            logger.info("Deleting 0 unused objects...")
+            logger.info(f"Deleting 0 unused objects and 0 superseded duplicates, freeing {format_file_size(0)}...")
             return repo_size_before, repo_size_before  # nothing worth doing; chunk indexes stay valid
 
         # crash-safety (#9748): invalidate chunk indexes before the first store change. This also
@@ -405,10 +503,15 @@ class ArchiveGarbageCollector:
                 forget[pid].add(id)
 
         # deleted counts index objects removed: every object of a dropped pack, plus the unused
-        # objects cut from rewritten packs. reclaimed counts the bytes freed.
+        # objects cut from rewritten packs. superseded counts the superseded duplicates in the dropped
+        # and rewritten packs. reclaimed counts the bytes freed.
         deleted = sum(len(ids) for ids in forget.values()) + sum(len(ids) for ids in drop.values())
+        superseded = sum(len(pack_superseded.get(pid, ())) for pid in pack_reclaim)
         reclaimed = sum(pack_reclaim.values())
-        logger.info(f"Deleting {deleted} unused objects, freeing {format_file_size(reclaimed)}...")
+        logger.info(
+            f"Deleting {deleted} unused objects and {superseded} superseded duplicates, "
+            f"freeing {format_file_size(reclaimed)}..."
+        )
         pi = ProgressIndicatorPercent(
             total=len(drop_packs) + len(rewrite_packs) + (1 if merge_packs else 0),
             msg="Compacting packs %3.1f%%",
@@ -432,14 +535,18 @@ class ArchiveGarbageCollector:
                 del self.chunks[id]
             progress += 1
             pi.show(progress)  # report after the work, so the final pack lands on 100%
-        validate = object_validator(self.manifest.repo_objs)
         for pid in rewrite_packs:
             if sig_int:
                 break
             # chunks=self.chunks: the index updates (repoint kept objects, remove dropped ones)
             # must land in the index that save_chunk_index() persists (#9850).
             _, dropped = self.repository.compact_pack(
-                pid, keep_ids=keep[pid], drop_ids=drop[pid], chunks=self.chunks, validate=validate
+                pid,
+                keep_ids=keep[pid],
+                drop_ids=drop[pid],
+                chunks=self.chunks,
+                validate=validate,
+                superseded_ranges=decode_ranges(pack_superseded.get(pid, ())),
             )
             freed += dropped  # unused indexed objects plus superseded duplicates
             progress += 1
@@ -484,11 +591,19 @@ class CompactMixIn:
             - backups of source files that encountered an I/O error mid-transfer and were skipped
             - corruption of the repository (e.g., the archives directory lost entries; see notes below)
 
-            ``borg compact`` reclaims objects the chunk index knows about, plus redundant copies of
-            indexed chunks (e.g. written by concurrent backups) that it finds while rewriting a pack.
-            Other bytes no index entry covers, such as packs left behind by a backup that crashed
-            before recording its objects, are re-indexed by ``borg check --repair`` and reclaimed by
-            the next ``borg compact``.
+            ``borg compact`` reclaims unused objects the chunk index knows about, plus copies of
+            chunks the index records at another location (e.g. written by concurrent backups, or by a
+            crashed backup that was re-run). Other bytes no index entry covers, such as packs left
+            behind by a backup that crashed before recording its objects, are kept.
+            ``borg check --repair`` (without ``--repository-only``) indexes one copy per chunk id,
+            so ``borg compact`` reclaims the objects whose chunk id had no index entry once they are
+            unused.
+
+            ``borg compact`` does not rewrite or merge packs that ``borg check`` recorded as corrupt
+            and warns about them. ``borg check --repair`` salvages such a pack: it replaces it by a pack
+            holding only the objects that authenticate with the key, which drops the corrupt chunks and
+            any damage outside a chunk (e.g. bytes appended to the pack). A pack in which no object
+            authenticates stays recorded corrupt and ``borg compact`` warns about it on every run.
 
             You usually do not want to run ``borg compact`` after every write operation, but
             either regularly (e.g., once a month, possibly together with ``borg check``) or
@@ -540,6 +655,7 @@ class CompactMixIn:
             dest="threshold",
             type=int,
             default=10,
-            help="rewrite a pack when at least PERCENT of its bytes are unused; also gates whether "
-            "to compact at all (see the all-packs gate above), 0 disables that gate (default: 10)",
+            help="rewrite a pack when at least PERCENT of its bytes are unused objects or copies of chunks "
+            "indexed at another location; also gates whether to compact at all (see the all-packs gate above), "
+            "0 disables that gate (default: 10)",
         )

@@ -12,6 +12,8 @@ This chapter details deployment strategies for the following scenarios.
    deployment/central-backup-server
    deployment/hosting-repositories
    deployment/automated-local
+   deployment/age
    deployment/image-backup
    deployment/pull-backup
    deployment/non-root-user
+   deployment/yubikey

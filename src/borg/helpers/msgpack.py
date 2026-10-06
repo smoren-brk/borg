@@ -61,6 +61,7 @@ from msgpack import version as mp_version
 
 from msgpack import ExtType, Timestamp
 from msgpack import OutOfData
+from msgpack import ExtraData  # NOQA
 
 
 version = mp_version
@@ -218,7 +219,7 @@ def is_supported_msgpack():
 
     if msgpack.version in []:  # < add bad releases here to deny list
         return False
-    return (1, 0, 3) <= msgpack.version[:3] <= (1, 2, 2)
+    return (1, 0, 3) <= msgpack.version[:3] <= (1, 2, 3)
 
 
 def get_limited_unpacker(kind):

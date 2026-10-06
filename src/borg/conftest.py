@@ -16,7 +16,8 @@ setup_logging()
 
 from borg.archiver import Archiver  # noqa: E402
 from borg.platform import set_flags  # noqa: E402
-from borg.testsuite import has_lchflags, has_llfuse, has_pyfuse3, has_mfusepy  # noqa: E402
+from borg.fuse_impl import has_llfuse, has_pyfuse3, has_mfusepy  # noqa: E402
+from borg.testsuite import has_lchflags  # noqa: E402
 from borg.testsuite import are_symlinks_supported, are_hardlinks_supported, is_utime_fully_supported  # noqa: E402
 from borg.testsuite.archiver import BORG_EXES
 from borg.testsuite.platform.platform_test import fakeroot_detected  # noqa: E402
@@ -162,7 +163,7 @@ class ArchiverSetup:
         self.patterns_file_path: str | None = None
 
     def get_kind(self) -> str:
-        if self.repository_location.startswith("rest://"):
+        if self.repository_location.startswith("ssh://"):
             return "remote"
         elif self.EXE == "borg.exe":
             return "binary"
@@ -218,7 +219,7 @@ def archiver(tmp_path, set_env_variables):
 
 @pytest.fixture()
 def remote_archiver(archiver, monkeypatch):
-    archiver.repository_location = "rest://" + "/" + str(archiver.repository_path)
+    archiver.repository_location = "ssh://__testsuite__/" + str(archiver.repository_path)
     # don't measure coverage in the "borg serve --rest" children, see #9470
     monkeypatch.delenv("COVERAGE_PROCESS_CONFIG", raising=False)
     monkeypatch.delenv("COVERAGE_PROCESS_START", raising=False)

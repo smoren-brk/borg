@@ -7,6 +7,13 @@ Each client holding a lock owns one small object below locks/ in the repository 
 (JSON) records the lock type (exclusive or shared), the owner's host / process / thread id and a
 timestamp (the "content timestamp"), stamped by the *owner's* clock when the object was written.
 Lock objects are immutable: to refresh a lock, the owner writes a new object and deletes the old one.
+
+The content is stored sealed (see the seal / unseal callables of Lock, Repository.acquire_lock provides
+them): wrapped in the repository key's envelope, encrypted and authenticated (just authenticated in the
+authenticated-* modes). The object's name is the store hash of the sealed content, so neither the
+content nor the name tells who uses the repository. A lock object that can not be unsealed (corrupt,
+tampered with, or not written by a borg with the repository key) is "unreadable": nothing is known
+about it but its store-side mtime, so it is treated as a foreign exclusive lock (see Staleness).
 Where the storage backend provides object timestamps (file, sftp, s3, current rest servers - not
 rclone), a lock object additionally carries a store-side mtime, stamped by the *storage's* clock at
 the same write instant; borgstore reports it as ItemInfo.mtime (0 if unavailable).
@@ -17,7 +24,19 @@ Shared locks may coexist, an exclusive lock must be alone. acquire() lists the l
 its own lock object if nothing forbids it, and lists again to detect a race with other clients
 creating theirs at the same time: an exclusive acquirer backs off if another exclusive lock showed
 up (and otherwise waits for remaining shared locks to go away), a shared acquirer backs off if an
-exclusive lock showed up. This is retried until the timeout.
+exclusive lock showed up. This is tried at least once, then retried until the timeout.
+
+This needs a store with list-after-write consistency: a listing started after a lock object was
+written must contain it. Then, of two clients racing for the lock, at least the one that created its
+lock object last sees the other's in its second listing, so they can not both get an exclusive lock
+(they might both back off, then they retry). Local filesystems, sftp, rest (``borg serve --rest``)
+and S3 as provided by AWS or MinIO give this guarantee.
+
+Between creating the lock object and the second listing, acquire() waits for the "race recheck
+delay" (default: 0.01s, BORG_LOCK_RECHECK_DELAY overrides it). With list-after-write consistency, it
+is not needed for correctness. Some stores only show a new object in listings after a lag, e.g. NFS
+clients caching directory listings or some cloud storages behind rclone: there, a delay of at least
+that lag is needed so that the client that created its lock object last still sees the other one.
 
 Staleness
 ---------
@@ -26,6 +45,9 @@ every listing judges each lock object and deletes it if it is stale:
 
 - Our own lock object (and, during a refresh, the one we are just replacing) is never stale: we are
   obviously alive and will refresh or release it.
+- An unreadable lock object is only stale if the store confirms that it was not written for longer than
+  the stale timeout (store "now" vs. its store-side mtime, see below). Without store-side mtimes, it is
+  never stale: then only break-lock removes it.
 - If the owner is a process on this machine and it is dead, the lock is stale. This is local
   knowledge, independent of any clock, so it is checked first and can not be vetoed by anything the
   storage says (a storage serving bogus, always-fresh mtimes must not be able to keep an abandoned
@@ -73,6 +95,8 @@ might have acquired its own lock meanwhile), so there is no safe way to continue
 
 import datetime
 import json
+import math
+import os
 import random
 import threading
 import time
@@ -83,7 +107,7 @@ from borgstore.store import ObjectNotFound
 from . import platform
 from .constants import MAX_MUTUAL_CLOCK_SKEW
 from .crypto.key import store_hash
-from .helpers import Error, ErrorWithTraceback, format_timedelta
+from .helpers import Error, ErrorWithTraceback, IntegrityError, format_timedelta
 from .logger import create_logger
 
 logger = create_logger(__name__)
@@ -93,6 +117,23 @@ logger = create_logger(__name__)
 # lock listings, None until harvested), plus time.monotonic() at its creation. always replaced as a
 # whole, so concurrent readers (e.g. a LockRefresher thread) never see a torn mix of its fields.
 LockAnchor = namedtuple("LockAnchor", "key dt mtime monotonic")
+
+DEFAULT_RACE_RECHECK_DELAY = 0.01  # [s], enough for stores with list-after-write consistency
+
+
+def get_race_recheck_delay():
+    """Return the race recheck delay [s]: BORG_LOCK_RECHECK_DELAY if set, else the default, see "Acquiring"."""
+    value = os.environ.get("BORG_LOCK_RECHECK_DELAY")
+    if not value:
+        return DEFAULT_RACE_RECHECK_DELAY
+    try:
+        delay = float(value)
+    except ValueError:
+        raise Error(f"BORG_LOCK_RECHECK_DELAY must be a number of seconds, but is: {value!r}") from None
+    if not math.isfinite(delay) or delay < 0:
+        raise Error(f"BORG_LOCK_RECHECK_DELAY must be a finite, non-negative number of seconds, but is: {value!r}")
+    return delay
+
 
 # why a refresh gives up: our own lock object is gone, see refresh().
 LOCK_KILLED_MSG = (
@@ -104,6 +145,8 @@ LOCK_KILLED_MSG = (
 
 def format_lock(lock):
     """Return a human readable description of a lock object: what it is, who holds it, since when."""
+    if lock["unreadable"]:
+        return f"unreadable lock object locks/{lock['key']}"
     kind = "exclusive" if lock["exclusive"] else "shared"
     age = format_timedelta(datetime.datetime.now(datetime.UTC) - lock["dt"])
     return f"{kind} lock on host {lock['hostid']}, pid {lock['processid']}, age {age}"
@@ -173,15 +216,21 @@ class Lock:
     (e.g., if an exception occurs).
     """
 
-    def __init__(self, store, exclusive=False, sleep=None, timeout=1.0, stale=30 * 60, id=None, repository=None):
+    def __init__(
+        self, store, exclusive=False, sleep=None, timeout=1.0, stale=30 * 60, id=None, repository=None, *, seal, unseal
+    ):
         self.store = store
+        # seal(bytes) -> bytes wraps a lock object's content into the key's envelope, unseal(bytes) -> bytes
+        # verifies and unwraps it (raises IntegrityError), see "Lock objects" above.
+        self.seal = seal
+        self.unseal = unseal
         # how to call the locked repository in messages to the user. the store's repr does not tell
         # which repository it is, so the caller should give a (credentials-free) repository name.
         self.repository = repository if repository is not None else str(store)
         self.is_exclusive = exclusive
         self.sleep = sleep
         self.timeout = timeout
-        self.race_recheck_delay = 0.01  # local: 0.01, network/slow remote: >= 1.0
+        self.race_recheck_delay = get_race_recheck_delay()
         self.other_locks_go_away_delay = 0.1  # local: 0.1, network/slow remote: >= 1.0
         self.retry_delay_min = 1.0
         self.retry_delay_max = 5.0
@@ -198,6 +247,7 @@ class Lock:
         self.blocking_locks_logged = False  # tell the user only once per Lock instance who blocks us
         self.skew_warned = False  # emit the clock-skew warning only once per Lock instance
         self.store_clock_step_warned = False  # emit the storage-clock-step warning only once per Lock instance
+        self.unreadable_warned = False  # emit the unreadable-lock warning only once per Lock instance
         self.id = id or platform.get_process_id()
         assert len(self.id) == 3
         logger.debug(f"LOCK-INIT: initializing. store: {store}, stale: {stale}s, refresh: {stale // 2}s.")
@@ -220,7 +270,7 @@ class Lock:
         now = dt if dt is not None else datetime.datetime.now(datetime.UTC)
         timestamp = now.isoformat(timespec="milliseconds")
         lock = dict(exclusive=exclusive, hostid=self.id[0], processid=self.id[1], threadid=self.id[2], time=timestamp)
-        value = json.dumps(lock).encode("utf-8")
+        value = self.seal(json.dumps(lock).encode("utf-8"))
         key = store_hash(value).hexdigest()
         logger.debug(f"LOCK-CREATE: creating lock in store. key: {key}, lock: {lock}.")
         self.store.store(f"locks/{key}", value)
@@ -252,7 +302,7 @@ class Lock:
                 # instead of re-deferring and re-creating a transient lock each time.
 
     def _is_our_lock(self, lock):
-        return self.id == (lock["hostid"], lock["processid"], lock["threadid"])
+        return not lock["unreadable"] and self.id == (lock["hostid"], lock["processid"], lock["threadid"])
 
     def _store_now(self):
         """Return the current time in the store's clock domain [UNIX timestamp], or None if unknown."""
@@ -326,6 +376,8 @@ class Lock:
         if self.skew_warned:
             return
         for lock in locks.values():
+            if lock["unreadable"]:
+                continue  # its content timestamp is unknown
             if self._is_our_lock(lock):
                 # our own lock object(s): e.g. during a refresh, our old and our new lock object -
                 # a storage clock step between their writes would make them look skewed against
@@ -343,6 +395,22 @@ class Lock:
             # if the machine is suspended while doing a backup or if there is a long stretch of
             # work without repository access, see #9883.
             return False
+        if lock["unreadable"]:
+            # we do not know anything about it but its store-side mtime: its owner, its content timestamp
+            # and whether it is exclusive are unknown. fail closed: it is only stale if the store confirms
+            # that it was not written for longer than the stale timeout, so without store-side mtimes it is
+            # never stale (break-lock removes it). a hostile store gains nothing by this: it can delete
+            # lock objects anyway.
+            if not lock["mtime"]:
+                return False
+            store_now = self._store_now()
+            if store_now is None:
+                lock["maybe_stale"] = True  # defer, see below
+                return False
+            if store_now <= lock["mtime"] + self.stale_td.total_seconds():
+                return False
+            logger.debug(f"LOCK-STALE: unreadable lock is too old for the store. lock: {lock}.")
+            return True
         if not platform.process_alive(lock["hostid"], lock["processid"], lock["threadid"]):
             # the lock owner is a process on THIS machine and it is dead - local knowledge,
             # independent of any clock and of the store. checked first (and never vetoed by
@@ -397,9 +465,16 @@ class Lock:
                 # the lock vanished between our listing and loading it, e.g. it was released
                 # by its owner or another client killed it as stale - so just ignore it.
                 continue
-            lock = json.loads(content.decode("utf-8"))
+            lock = self._parse_lock(content)
+            if lock is None:
+                if not self.unreadable_warned:
+                    self.unreadable_warned = True
+                    logger.warning(
+                        f"Repository {self.repository} has an unreadable lock object locks/{key}, it is treated "
+                        f"as an exclusive lock. If no borg is using this repository, remove it with borg break-lock."
+                    )
+                lock = dict(unreadable=True, exclusive=True, hostid=None, processid=None, threadid=None, dt=None)
             lock["key"] = key
-            lock["dt"] = datetime.datetime.fromisoformat(lock["time"])
             lock["mtime"] = info.mtime  # store-side mtime [s], 0 if the backend can not provide it
             locks[key] = lock
         my_key = self.my_lock_key  # single read - a LockRefresher thread may rebind it concurrently
@@ -428,14 +503,29 @@ class Lock:
         self._check_clock_skew(locks)
         return locks
 
+    def _parse_lock(self, content):
+        """Unseal and parse the content of a lock object. Return the lock dict, or None if it is unreadable."""
+        try:
+            lock = json.loads(bytes(self.unseal(content)).decode("utf-8"))
+            lock = dict(
+                unreadable=False,
+                exclusive=bool(lock["exclusive"]),
+                hostid=lock["hostid"],
+                processid=lock["processid"],
+                threadid=lock["threadid"],
+                dt=datetime.datetime.fromisoformat(lock["time"]),
+            )
+        except (IntegrityError, UnicodeDecodeError, ValueError, KeyError, TypeError) as err:
+            logger.debug(f"LOCK-PARSE: unreadable lock object: {err!r}.")
+            return None
+        return lock
+
     def _find_locks(self, *, only_exclusive=False, only_mine=False):
         locks = self._get_locks()
         found_locks = []
         for key in locks:
             lock = locks[key]
-            if (not only_exclusive or lock["exclusive"]) and (
-                not only_mine or (lock["hostid"], lock["processid"], lock["threadid"]) == self.id
-            ):
+            if (not only_exclusive or lock["exclusive"]) and (not only_mine or self._is_our_lock(lock)):
                 found_locks.append(lock)
         return found_locks
 
@@ -446,7 +536,8 @@ class Lock:
         logger.debug(f"LOCK-ACQUIRE: trying to acquire a lock. exclusive: {self.is_exclusive}.")
         started = time.monotonic()
         blocking_locks = []  # the foreign lock(s) that most recently kept us from acquiring
-        while time.monotonic() - started < self.timeout:
+        # try at least once, even with timeout 0 or if a try already used up the timeout.
+        while True:
             exclusive_locks = self._find_locks(only_exclusive=True)
             if all(lock.get("maybe_stale") for lock in exclusive_locks):
                 # there are no exclusive locks (or only ones that look stale, but whose staleness
@@ -463,12 +554,15 @@ class Lock:
                 if self.is_exclusive:
                     if len(exclusive_locks) == 1 and exclusive_locks[0]["key"] == key:
                         logger.debug("LOCK-ACQUIRE: we are the only exclusive lock!")
-                        while time.monotonic() - started < self.timeout:
+                        # check the other locks at least once before looking at the timeout.
+                        while True:
                             locks = self._find_locks(only_exclusive=False)
                             if len(locks) == 1 and locks[0]["key"] == key:
                                 logger.debug("LOCK-ACQUIRE: success! no non-exclusive locks are left!")
                                 return self
                             blocking_locks = [lock for lock in locks if lock["key"] != key]
+                            if time.monotonic() - started >= self.timeout:
+                                break
                             self._log_blocking_locks(blocking_locks)
                             time.sleep(self.other_locks_go_away_delay)
                         logger.debug("LOCK-ACQUIRE: timeout while waiting for non-exclusive locks to go away.")
@@ -492,6 +586,8 @@ class Lock:
             else:
                 # there is at least one exclusive lock we can not consider stale - it blocks us.
                 blocking_locks = exclusive_locks
+            if time.monotonic() - started >= self.timeout:
+                break
             self._log_blocking_locks(blocking_locks)
             # wait a random bit before retrying
             time.sleep(
@@ -527,6 +623,7 @@ class Lock:
     def break_lock(self):
         """Breaks all locks (not just ours)."""
         logger.debug("LOCK-BREAK: break_lock() was called - deleting ALL locks!")
+        self.unreadable_warned = True  # no advice to run break-lock, we are just doing that
         locks = self._get_locks()
         for key in locks:
             logger.info(f"Breaking {format_lock(locks[key])}.")

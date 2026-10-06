@@ -321,6 +321,7 @@ class CreateMixIn:
                 archive_name=args.name,
                 archive_group_by=tuple(args.group_by.split(",")),
             ) as cache:
+                cache.chunks  # load the chunk index now, its progress output must precede the archive progress
                 archive = Archive(
                     manifest,
                     args.name,
@@ -783,7 +784,8 @@ class CreateMixIn:
         The archive will consume almost no disk space for files or parts of files that
         have already been stored in other archives.
 
-        The ``--tags`` option can be used to add a list of tags to the new archive.
+        The ``--tag`` option can be used to add a tag to the new archive. To add
+        multiple tags, give it multiple times, e.g. ``--tag foo --tag bar``.
 
         The archive name does not need to be unique; you can and should use the same
         name for a series of archives. The unique archive identifier is its ID (hash),
@@ -1332,10 +1334,11 @@ class CreateMixIn:
             metavar="PARAMS",
             dest="chunker_params",
             type=ChunkerParams,
-            default=CHUNKER_PARAMS,
+            default=DEFAULT_CHUNKER_PARAMS,  # see default_chunker_params()
             action=Highlander,
             help="specify the chunker parameters (ALGO, CHUNK_MIN_EXP, CHUNK_MAX_EXP, "
-            "HASH_MASK_BITS, NC_LEVEL). default: %s,%d,%d,%d,%d" % CHUNKER_PARAMS,
+            "HASH_MASK_BITS, NC_LEVEL). default: the repository default (see borg repo-create), "
+            "else %s,%d,%d,%d,%d" % CHUNKER_PARAMS,
         )
         archive_group.add_argument(
             "-C",
@@ -1343,17 +1346,21 @@ class CreateMixIn:
             metavar="COMPRESSION",
             dest="compression",
             type=CompressionSpec,
-            default=CompressionSpec("lz4"),
+            default=None,  # None: not given, see default_compression()
             action=Highlander,
-            help="select compression algorithm, see the output of the " '"borg help compression" command for details.',
+            help="select compression algorithm, see the output of the "
+            '"borg help compression" command for details. '
+            "Default: the repository default (see borg repo-create), else lz4.",
         )
         archive_group.add_argument(
-            "--tags",
+            "--tag",
             metavar="TAG",
             dest="tags",
             type=helpers.tag_validator,
-            nargs="+",
-            help="add tags to archive (comma-separated or multiple arguments)",
+            # "extend" with nargs=1: one tag per option (so it can not swallow NAME), giving a flat list of tags.
+            action="extend",
+            nargs=1,
+            help="add tag to archive (can be given multiple times)",
         )
 
         subparser.add_argument("name", metavar="NAME", type=archivename_validator, help="specify the archive name")

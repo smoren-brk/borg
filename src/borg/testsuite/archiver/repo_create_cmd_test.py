@@ -1,12 +1,19 @@
+import json
 import os
 from unittest.mock import patch
 
 import pytest
 
-from ...helpers.errors import Error, CancelledByUser
+from ...archiver import repo_create_cmd
+from ...cache import list_chunkindex_hashes, read_chunkindex_from_repo
+from ...compress import CNONE, LZ4, ZLIB, ZSTD
+from ...helpers.errors import Error, CancelledByUser, IntegrityError
 from ...constants import *  # NOQA
 from ...crypto.key import FlexiKey
-from . import cmd, create_src_archive, generate_archiver_tests, RK_ENCRYPTION, KF_ENCRYPTION, KF_LOCATION
+from ...manifest import Manifest
+from ...repository import Repository, repo_lister
+from . import cmd, create_regular_file, create_src_archive, generate_archiver_tests, open_repository
+from . import RK_ENCRYPTION, KF_ENCRYPTION, KF_LOCATION
 
 pytest_generate_tests = lambda metafunc: generate_archiver_tests(metafunc, kinds="local,binary")  # NOQA
 
@@ -159,3 +166,189 @@ def test_repo_create_failure_leaves_nothing_behind(archivers, request, monkeypat
     # and nothing stands in the way of creating the repository there now.
     cmd(archiver, "repo-create", KF_ENCRYPTION, KF_LOCATION)
     assert os.listdir(keys_dir)
+
+
+def test_repo_create_writes_an_empty_chunk_index(archivers, request):
+    # repo-create stores an empty chunk index (in the key's envelope), so the first use of the repository
+    # does not have to build it by listing the packs.
+    archiver = request.getfixturevalue(archivers)
+    cmd(archiver, "repo-create", RK_ENCRYPTION)
+    with open_repository(archiver) as repository:
+        hashes = list_chunkindex_hashes(repository)
+        assert len(hashes) == 1
+        chunks = read_chunkindex_from_repo(repository, hashes[0])
+        assert chunks is not None and len(chunks) == 0
+
+
+def test_repo_create_chunk_index_failure_leaves_nothing_behind(archivers, request, monkeypatch):
+    archiver = request.getfixturevalue(archivers)
+    if archiver.EXE:
+        pytest.skip("patches object")
+    keys_dir = os.path.join(archiver.tmpdir, "keys")
+    monkeypatch.setenv("BORG_KEYS_DIR", keys_dir)
+
+    def failing_write_chunkindex_to_repo(*args, **kwargs):
+        raise OSError("simulated store failure while writing the chunk index")
+
+    with patch.object(repo_create_cmd, "write_chunkindex_to_repo", failing_write_chunkindex_to_repo):
+        if archiver.FORK_DEFAULT:
+            cmd(archiver, "repo-create", KF_ENCRYPTION, KF_LOCATION, exit_code=2)
+        else:
+            with pytest.raises(OSError, match="simulated store failure"):
+                cmd(archiver, "repo-create", KF_ENCRYPTION, KF_LOCATION)
+    assert not os.path.exists(archiver.repository_location)
+    assert not os.path.exists(keys_dir) or not os.listdir(keys_dir)
+
+
+def stored_compression(archiver):
+    """Return the set of (ctype, clevel) of the compressed objects in the repository.
+
+    Objects that do not get smaller by compression are stored uncompressed, they are left out.
+    """
+    with open_repository(archiver) as repository:
+        manifest = Manifest.load(repository)
+        result = set()
+        for id, _ in repo_lister(repository, limit=LIST_SCAN_LIMIT):
+            meta = manifest.repo_objs.parse_meta(id, repository.get(id, read_data=False), ro_type=ROBJ_DONTCARE)
+            if meta["ctype"] != CNONE.ID:
+                result.add((meta["ctype"], meta["clevel"]))
+        return result
+
+
+def test_repo_create_default_compression(archivers, request, monkeypatch):
+    archiver = request.getfixturevalue(archivers)
+    create_regular_file(archiver.input_path, "file1", size=1024 * 80)
+    cmd(archiver, "repo-create", RK_ENCRYPTION, "--compression=zstd,5")
+    assert "Default compression: zstd,5" + os.linesep in cmd(archiver, "repo-info")
+    assert json.loads(cmd(archiver, "repo-info", "--json"))["defaults"]["compression"] == "zstd,5"
+    # without --compression, create uses the repository default.
+    cmd(archiver, "create", "test", "input")
+    assert stored_compression(archiver) == {(ZSTD.ID, 5)}
+    # --compression wins over the repository default, and without it, the repository default is used again.
+    cmd(archiver, "repo-compress", "--compression=lz4")
+    assert stored_compression(archiver) == {(LZ4.ID, 255)}
+    cmd(archiver, "repo-compress")
+    assert stored_compression(archiver) == {(ZSTD.ID, 5)}
+    # a compression given via the environment wins over the repository default, too.
+    monkeypatch.setenv("BORG_REPO_COMPRESS__COMPRESSION", "zlib,3")
+    cmd(archiver, "repo-compress")
+    assert stored_compression(archiver) == {(ZLIB.ID, 3)}
+
+
+def test_repo_create_without_default_compression(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    create_regular_file(archiver.input_path, "file1", size=1024 * 80)
+    cmd(archiver, "repo-create", RK_ENCRYPTION)
+    with open_repository(archiver) as repository:
+        assert repository.load_defaults() == {}  # the object exists (else DefaultsMissing), but is empty
+    output = cmd(archiver, "repo-info")
+    assert "Default compression: lz4 (built-in)" + os.linesep in output
+    assert "Default chunker params: %s,%d,%d,%d,%d (built-in)" % CHUNKER_PARAMS + os.linesep in output
+    assert json.loads(cmd(archiver, "repo-info", "--json"))["defaults"] == {
+        "compression": "lz4",
+        "chunker_params": "%s,%d,%d,%d,%d" % CHUNKER_PARAMS,
+    }
+    cmd(archiver, "create", "test", "input")
+    assert stored_compression(archiver) == {(LZ4.ID, 255)}
+    assert archive_chunker_params(archiver, "test") == list(CHUNKER_PARAMS)
+
+
+def test_repo_create_rejects_invalid_compression(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    cmd(archiver, "repo-create", RK_ENCRYPTION, "--compression=zstd,99", exit_code=2)
+    assert not os.path.exists(archiver.repository_path)
+
+
+def test_default_compression_tampered(archivers, request):
+    # the repository defaults are authenticated: changing them without the key is detected.
+    archiver = request.getfixturevalue(archivers)
+    cmd(archiver, "repo-create", RK_ENCRYPTION, "--compression=obfuscate,110,zstd,3")
+    with open_repository(archiver) as repository:
+        envelope = bytearray(repository.store_load("config/defaults"))
+        envelope[-1] ^= 1
+        repository.store_store("config/defaults", bytes(envelope))
+    if archiver.FORK_DEFAULT:
+        cmd(archiver, "create", "test", "input", exit_code=IntegrityError("x").exit_code)
+    else:
+        with pytest.raises(IntegrityError):
+            cmd(archiver, "create", "test", "input")
+
+
+def test_default_compression_invalid(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    cmd(archiver, "repo-create", RK_ENCRYPTION)
+    with open_repository(archiver) as repository:
+        repository.save_defaults({"compression": "nosuchcompression"})
+    if archiver.FORK_DEFAULT:
+        exit_code = Repository.InvalidRepositoryConfig("x", "y").exit_code
+        cmd(archiver, "create", "test", "input", exit_code=exit_code)
+    else:
+        with pytest.raises(Repository.InvalidRepositoryConfig):
+            cmd(archiver, "create", "test", "input")
+
+
+def archive_chunker_params(archiver, name):
+    return json.loads(cmd(archiver, "info", "--json", name))["archives"][0]["chunker_params"]
+
+
+def test_repo_create_default_chunker_params(archivers, request, monkeypatch):
+    archiver = request.getfixturevalue(archivers)
+    create_regular_file(archiver.input_path, "file1", size=1024 * 80)
+    cmd(archiver, "repo-create", RK_ENCRYPTION, "--chunker-params=fixed,4096")
+    assert "Default chunker params: fixed,4096,0" + os.linesep in cmd(archiver, "repo-info")
+    assert json.loads(cmd(archiver, "repo-info", "--json"))["defaults"]["chunker_params"] == "fixed,4096,0"
+    # without --chunker-params (or with "default"), create uses the repository default.
+    cmd(archiver, "create", "test1", "input")
+    assert archive_chunker_params(archiver, "test1") == ["fixed", 4096, 0]
+    cmd(archiver, "create", "--chunker-params=default", "test2", "input")
+    assert archive_chunker_params(archiver, "test2") == ["fixed", 4096, 0]
+    # given chunker params win over the repository default, also when given via the environment.
+    cmd(archiver, "create", "--chunker-params=fixed,8192", "test3", "input")
+    assert archive_chunker_params(archiver, "test3") == ["fixed", 8192, 0]
+    monkeypatch.setenv("BORG_CREATE__CHUNKER_PARAMS", "fixed,16384")
+    cmd(archiver, "create", "test4", "input")
+    assert archive_chunker_params(archiver, "test4") == ["fixed", 16384, 0]
+    # recreate only rechunks if asked to, "default" rechunks to the repository default.
+    cmd(archiver, "recreate", "-a", "test3")
+    assert archive_chunker_params(archiver, "test3") == ["fixed", 8192, 0]
+    cmd(archiver, "recreate", "-a", "test3", "--chunker-params=default")
+    assert archive_chunker_params(archiver, "test3") == ["fixed", 4096, 0]
+
+
+def test_repo_create_chunker_params_default_is_no_repository_default(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    cmd(archiver, "repo-create", RK_ENCRYPTION, "--chunker-params=default")
+    with open_repository(archiver) as repository:
+        assert repository.load_defaults() == {}
+
+
+def test_default_chunker_params_invalid(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    cmd(archiver, "repo-create", RK_ENCRYPTION)
+    with open_repository(archiver) as repository:
+        repository.save_defaults({"chunker_params": "fixed,1"})
+    if archiver.FORK_DEFAULT:
+        exit_code = Repository.InvalidRepositoryConfig("x", "y").exit_code
+        cmd(archiver, "create", "test", "input", exit_code=exit_code)
+    else:
+        with pytest.raises(Repository.InvalidRepositoryConfig):
+            cmd(archiver, "create", "test", "input")
+
+
+def test_defaults_missing(archivers, request):
+    # repo-create always writes config/defaults, so a missing object was removed: the commands that use
+    # the defaults refuse to run, unless every default is given explicitly (see check for the repair).
+    archiver = request.getfixturevalue(archivers)
+    create_regular_file(archiver.input_path, "file1", size=1024 * 80)
+    cmd(archiver, "repo-create", RK_ENCRYPTION, "--compression=zstd,5")
+    with open_repository(archiver) as repository:
+        repository.store_delete("config/defaults")
+    for args in (("create", "test", "input"), ("repo-info",)):
+        if archiver.FORK_DEFAULT:
+            output = cmd(archiver, *args, exit_code=Repository.DefaultsMissing("x").exit_code)
+            assert "borg check --repair" in output
+        else:
+            with pytest.raises(Repository.DefaultsMissing):
+                cmd(archiver, *args)
+    cmd(archiver, "create", "--compression=lz4", "--chunker-params=fixed,4096", "test", "input")
+    assert stored_compression(archiver) == {(LZ4.ID, 255)}

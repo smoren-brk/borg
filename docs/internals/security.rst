@@ -37,6 +37,11 @@ Under these circumstances Borg guarantees that the attacker cannot
    structural information such as the object graph (which archives
    refer to what chunks)
 
+Guarantees 3 and 4 need an encrypting mode (not ``authenticated-*``). For 4, this
+includes the store objects borg keeps next to the packs: the chunk index fragments
+and the per-archive reference caches are encrypted with the key, too, see
+:ref:`store object envelope <store_object_envelope>`.
+
 The attacker can always impose a denial of service by definition (they could
 block connections to the repository, or delete it partly or entirely).
 
@@ -352,8 +357,11 @@ used:
   object's metadata slot and data slot are encrypted and authenticated with the borg
   key (see :ref:`security_encryption`); its per-object header is unencrypted and
   carries the magic, the format version and the chunk id (see :ref:`pack-format`).
-- ``index/<store hash>`` -- the chunk id to pack location index. It is not encrypted,
-  but it only contains chunk ids and locations, which the pack headers expose anyway.
+- ``index/<store hash>`` -- the chunk id to pack location index, in the key's
+  :ref:`store object envelope <store_object_envelope>`: encrypted and authenticated
+  in the encrypting modes, authenticated only in the ``authenticated-*`` modes. It
+  contains chunk ids and locations, which the pack headers expose anyway; the
+  fragment names and sizes reveal a rough chunk count.
 - ``archives/<hex(archive_id)>`` -- one empty object per archive. The archive name,
   its timestamps, the item metadata and the chunk lists all live inside encrypted
   repository objects, so the pointer object itself only reveals the archive id (a MAC
@@ -381,17 +389,25 @@ used:
     client never ends up using key material of the attacker's choice.
 - ``keys/<store hash>`` -- in ``repokey`` mode, the borg key(s), encrypted with the
   passphrase-derived KEK (see :ref:`key_encryption`).
-- ``locks/*`` and ``cache/*``. Note that the per-archive reference caches
-  ``cache/referenced-by-archive.<hex(archive_id)>``, written by ``borg compact`` and
-  ``borg analyze``, are *not* encrypted: they list the object ids and plaintext sizes
-  an archive references.
+- ``cache/*``: ``cache/checked-packs`` (the ``borg check`` results per pack) and the
+  per-archive reference caches ``cache/referenced-by-archive.<hex(archive_id)>``
+  (written by ``borg compact`` and ``borg analyze``, they list the object ids and
+  plaintext sizes an archive references) are in the key's store object envelope, like
+  the index. The envelope binds each object to its repository and name, so the store
+  can not make borg use the reference cache of one archive for another one, or the
+  index or cache objects of another repository using the same key material. Their names still show
+  the archive ids that have a reference cache and that a check ran.
+  ``cache/chunkindex-invalid`` is an empty marker object.
+- ``locks/*`` -- the repository locks are in the key's store object envelope, like the
+  index, and are named by the store hash of the envelope. The store only sees how many
+  lock objects there are and when they were written, not who holds them.
 
 Authorization and transport security come from the transport, not from borg.
 
-Remote repositories over SSH: ``rest://``
+Remote repositories over SSH: ``ssh://``
 -----------------------------------------
 
-For a ``rest://`` repository, borg runs ``borg serve --rest --backend FILE:<path>``
+For an ``ssh://`` repository, borg runs ``borg serve --rest --backend FILE:<path>``
 on the remote machine and speaks HTTP to it over that process' *stdin/stdout* -- not
 over a socket. If the URL contains a host, the process is started through the
 system's SSH client (honouring ``BORG_RSH`` / ``BORGSTORE_RSH`` for the ssh command
@@ -438,7 +454,7 @@ its dependencies, so their security properties are those of the respective libra
 - ``http(s)://`` talks to a borgstore REST server over plain HTTP, authenticating
   with HTTP Basic auth taken from the URL or from ``BORGSTORE_REST_USERNAME`` /
   ``BORGSTORE_REST_PASSWORD``. Basic auth sends the credentials to the server on
-  every request, so use ``https`` if you use this at all. ``rest://`` over SSH needs
+  every request, so use ``https`` if you use this at all. ``ssh://`` needs
   no such credentials.
 
 In every case the repository never receives the borg key or the passphrase, so a
@@ -451,11 +467,10 @@ Legacy borg 1.x RPC protocol
 
 ``borg serve`` *without* ``--rest`` still speaks the borg 1.x RPC protocol:
 msgpack'd messages exchanged over stdio (``borg.legacy.remote``). It exists only so
-that borg 2 can *read* a borg 1.x repository through an ``ssh://`` URL, e.g. for
-``borg transfer --from-borg1``; ``ssh://`` is rejected for current repositories, and
-this protocol cannot serve one. Its transport is the system's SSH client, so the same
-"authorization and transport security are SSH's" reasoning as for ``rest://``
-applies.
+that borg 2 can *read* a borg 1.x repository through an ``ssh://`` URL with
+``--from-borg1``, e.g. for ``borg transfer --from-borg1``; it cannot serve a current
+repository. Its transport is the system's SSH client, so the same
+"authorization and transport security are SSH's" reasoning as for REST applies.
 
 Within that protocol, critical vulnerabilities such as remote code execution are
 inhibited by its design:
@@ -512,8 +527,8 @@ while libssl implements TLS and related protocols.
 The latter historically contained most vulnerabilities, especially critical ones, and Borg's own
 extension modules do not use it: they link ``libcrypto`` only. Note that libssl can still be
 reached through Python's ``ssl`` module by the transports that do networking inside the borg
-process, i.e. ``s3:``/``b2:`` and ``http(s)://`` (see :ref:`remote_access_security`); ``rest://``
-and the legacy ``ssh://`` protocol do not need it, as they only talk to a subprocess over pipes.
+process, i.e. ``s3:``/``b2:`` and ``http(s)://`` (see :ref:`remote_access_security`); ``ssh://``
+(REST and the legacy protocol) does not need it, as it only talks to a subprocess over pipes.
 Accordingly, the binaries released by the project do include Python's ``ssl``/``_ssl`` modules
 (they are needed by pyfuse3/trio as well).
 

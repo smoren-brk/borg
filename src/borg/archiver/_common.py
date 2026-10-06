@@ -6,11 +6,13 @@ import borg
 from ..archive import Archive
 from ..constants import *  # NOQA
 from ..cache import Cache, assert_secure
+from ..crypto.key import key_factory
 from ..helpers import CommandError, Error
 from ..helpers import SortBySpec, location_validator, Location, relative_time_marker_validator
 from ..helpers import FilesystemPathSpec
+from ..helpers import ChunkerParams, CompressionSpec
 from ..helpers import Highlander, octal_int
-from ..helpers.argparsing import SUPPRESS, PositiveInt
+from ..helpers.argparsing import SUPPRESS, ArgumentTypeError, PositiveInt
 from ..helpers.nanorst import rst_to_terminal
 from ..manifest import Manifest, AI_HUMAN_SORT_KEYS
 from ..patterns import PatternMatcher
@@ -29,26 +31,24 @@ from ..logger import create_logger
 logger = create_logger(__name__)
 
 
-def get_repository(location, *, create, exclusive, lock_wait, lock, args, v1_legacy, allow_incomplete=False):
+def get_repository(
+    location, *, create, exclusive, lock_wait, lock, args, v1_legacy, allow_incomplete=False, other=False
+):
     # create_config=False: when creating, the command (repo-create) writes the repository config itself,
     # once the key exists, see Repository.create(). For an existing repository, the flag is irrelevant.
-    if location.proto == "ssh":
-        if v1_legacy:
-            from ..legacy.remote import LegacyRemoteRepository
+    # other=True: the "other" repository, its key is loaded with the BORG_OTHER_* settings (see key_factory).
+    key_loader = functools.partial(key_factory, other=True) if other else None
+    if location.proto == "ssh" and v1_legacy:
+        # legacy borg 1.x repository, served by a remote "borg serve" via the legacy RPC protocol
+        from ..legacy.remote import LegacyRemoteRepository
 
-            repository = LegacyRemoteRepository(
-                location, create=create, exclusive=exclusive, lock_wait=lock_wait, lock=lock, args=args
-            )
-        else:
-            raise Error(
-                "ssh:// is no longer supported for current repositories; use rest:// instead "
-                "(it can tunnel over ssh). ssh:// remains available only for legacy v1 repositories "
-                "via --from-borg1."
-            )
+        repository = LegacyRemoteRepository(
+            location, create=create, exclusive=exclusive, lock_wait=lock_wait, lock=lock, args=args
+        )
 
     elif (
-        location.proto in ("rest", "sftp", "file", "http", "https", "rclone", "s3", "b2") and not v1_legacy
-    ):  # stuff directly supported by borgstore
+        location.proto in ("ssh", "sftp", "file", "http", "https", "rclone", "s3", "b2") and not v1_legacy
+    ):  # stuff directly supported by borgstore (ssh: REST via a remote "borg serve --rest")
         repository = Repository(
             location,
             create=create,
@@ -57,6 +57,7 @@ def get_repository(location, *, create, exclusive, lock_wait, lock, args, v1_leg
             exclusive=exclusive,
             lock_wait=lock_wait,
             lock=lock,
+            key_loader=key_loader,
         )
 
     else:
@@ -75,8 +76,40 @@ def get_repository(location, *, create, exclusive, lock_wait, lock, args, v1_leg
                 exclusive=exclusive,
                 lock_wait=lock_wait,
                 lock=lock,
+                key_loader=key_loader,
             )
     return repository
+
+
+def _repository_default(repository, name, parse, builtin):
+    """Return the repository default for option name (see Repository.save_defaults), parsed, else builtin."""
+    value = repository.load_defaults().get(name) if isinstance(repository, Repository) else None
+    if value is None:
+        return builtin
+    try:
+        return parse(value)
+    except (ArgumentTypeError, ValueError) as err:
+        raise Repository.InvalidRepositoryConfig(
+            repository._location.canonical_path(), f"invalid default {name} {value!r}: {err}"
+        ) from None
+
+
+def default_compression(repository):
+    """Return the CompressionSpec a command uses if --compression was not given.
+
+    That is the repository default (set by "borg repo-create --compression"), else lz4.
+    An explicitly configured compression (command line, environment, default.yaml) always wins.
+    """
+    return _repository_default(repository, "compression", CompressionSpec, CompressionSpec(BUILTIN_COMPRESSION))
+
+
+def default_chunker_params(repository):
+    """Return the chunker params for "--chunker-params default" (the default of create and import-tar).
+
+    That is the repository default (set by "borg repo-create --chunker-params"), else CHUNKER_PARAMS.
+    Explicitly configured chunker params (command line, environment, default.yaml) always win.
+    """
+    return _repository_default(repository, "chunker_params", ChunkerParams, CHUNKER_PARAMS)
 
 
 def with_repository(
@@ -150,10 +183,15 @@ def with_repository(
                         ro_cls = RepoObj1
                     manifest_ = Manifest.load(repository, other=False, ro_cls=ro_cls)
                     kwargs["manifest"] = manifest_
-                    if "compression" in args:
-                        manifest_.repo_objs.compressor = args.compression.compressor
                     if secure:
                         assert_secure(repository, manifest_)
+                    # the repository defaults are read only after the security checks passed.
+                    if "compression" in args:
+                        if args.compression is None:  # not given, see default_compression()
+                            args.compression = default_compression(repository)
+                        manifest_.repo_objs.compressor = args.compression.compressor
+                    if "chunker_params" in args and args.chunker_params == DEFAULT_CHUNKER_PARAMS:
+                        args.chunker_params = default_chunker_params(repository)
                 if cache:
                     with Cache(
                         repository,
@@ -199,6 +237,7 @@ def with_other_repository(manifest=False, cache=False, required=False):
                 lock=True,
                 args=args,
                 v1_legacy=v1_legacy,
+                other=True,
             )
 
             with repository:
@@ -276,6 +315,7 @@ rst_plain_text_references = {
     "home_config_borg": 'FAQ -> "How important is the borg config directory?"',
     "home_data_borg": 'FAQ -> "How important is the borg data directory?"',
     "json_output": "Internals -> All about JSON: How to develop frontends",
+    "storelocking": "Internals -> Data structures and file formats -> Locks (storelocking)",
 }
 
 

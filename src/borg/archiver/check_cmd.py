@@ -3,16 +3,50 @@ import os
 from ._common import with_repository, Highlander
 from ..archive import ArchiveChecker
 from ..constants import *  # NOQA
-from ..crypto.key import key_factory, RepositoryKeyInfoMissing
-from ..helpers import set_ec, EXIT_WARNING, CancelledByUser, CommandError, Error
+from ..crypto.key import key_factory
+from ..helpers import set_ec, EXIT_WARNING, CancelledByUser, CommandError, Error, IntegrityError
 from ..helpers import relative_time_marker_validator, yes, ArchiveFormatter, sig_int
 from ..helpers.argparsing import ArgumentParser
 from ..helpers.time import archive_ts_now, calculate_relative_offset
-from ..repoobj import RepoObj, object_validator
+from ..repoobj import RepoObj, ObjectsNotAuthenticatable, object_validator, whole_object_authenticator
+from ..repository import Repository, DEFAULTS_NAME
 
 from ..logger import create_logger
 
 logger = create_logger()
+
+
+def check_repository_defaults(repository, *, repair):
+    """Verify the repository defaults object (config/defaults, see Repository.load_defaults).
+
+    "borg repo-create" always writes it, so a missing object was removed (or lost), like one that fails
+    the authentication of the key's envelope or does not deserialize. Such an object is an error: the
+    commands using the defaults refuse to run. With repair, empty defaults are stored instead, so the
+    repository can be used again (with the built-in defaults).
+
+    Returns False if a problem was found and not repaired.
+    """
+    try:
+        repository.load_defaults()
+    except Repository.DefaultsMissing:
+        problem = "is missing"
+    except IntegrityError:
+        problem = "fails the authentication"
+    except Repository.InvalidRepositoryConfig:
+        problem = "is malformed"
+    else:
+        return True
+    if not repair:
+        logger.error(
+            f'Repository defaults object {DEFAULTS_NAME} {problem}. Run "borg check --repair" to store empty defaults.'
+        )
+        return False
+    logger.warning(
+        f"Repository defaults object {DEFAULTS_NAME} {problem}, storing empty defaults. "
+        "The defaults set by borg repo-create are lost, the built-in defaults are used now."
+    )
+    repository.save_defaults({})
+    return True
 
 
 class CheckMixIn:
@@ -54,10 +88,6 @@ class CheckMixIn:
             max_age = 0
         if args.repair and args.max_duration:
             raise CommandError("--repair does not allow --max-duration argument.")
-        if args.repair and args.max_age is not None:
-            # repair verifies every pack; reusing recorded results during repair needs repository
-            # repair (refs #8572).
-            raise CommandError("--repair does not allow the --max-age option.")
         if args.archives_only and args.max_age is not None:
             # --max-age only affects the repository check; --archives-only skips it.
             raise CommandError("--archives-only does not allow the --max-age option.")
@@ -65,14 +95,13 @@ class CheckMixIn:
             # --max-duration limits only the repository check; the archives check has no max_duration
             # support.
             raise CommandError("--repository-only is required for --max-duration support.")
+        # every check needs the key, a --repository-only one included. ask NOW for the passphrase, not
+        # after a repository check that can take hours, #1931. the key class comes from the repository
+        # config, so loading the key reads no object.
+        key = key_factory(repository)
         if not args.repo_only:
-            # if we need the key later for the archives check, ask NOW for the passphrase! #1931
             archive_checker = ArchiveChecker()
-            try:
-                archive_checker.key = archive_checker.make_key(repository)
-            except RepositoryKeyInfoMissing:
-                if args.repair:
-                    raise  # repair needs the key to validate the index rebuild
+            archive_checker.key = key
             if args.format is not None:
                 format = args.format
             else:
@@ -81,21 +110,28 @@ class CheckMixIn:
             # the repository check has finished, which can take hours.
             ArchiveFormatter.validate_format(format)
         if not args.archives_only:
-            validate = None  # the object validator for the index rebuild, which only a repair does
+            repo_objs = RepoObj(key)
+            authenticate = None
             if args.repair:
-                # the key class comes from the repository config, so loading the key reads no object.
-                key = archive_checker.key if not args.repo_only else key_factory(repository)
-                validate = object_validator(RepoObj(key))
+                try:
+                    authenticate = whole_object_authenticator(repo_objs)
+                except ObjectsNotAuthenticatable:
+                    # no key material to verify an object's tags with, so no pack is salvaged;
+                    # Repository._salvage_corrupt_packs reports that.
+                    pass
             if not repository.check(
                 repair=args.repair,
                 max_duration=args.max_duration,
                 max_age=max_age,
                 repo_only=args.repo_only,
-                validate=validate,
+                validate=object_validator(repo_objs),
+                authenticate=authenticate,
             ):
                 set_ec(EXIT_WARNING)
             if sig_int:  # repository check interrupted; skip the archive check
                 raise Error("Got Ctrl-C / SIGINT.")
+            if not check_repository_defaults(repository, repair=args.repair):
+                set_ec(EXIT_WARNING)
         if not args.repo_only and not archive_checker.check(
             repository,
             verify_data=args.verify_data,
@@ -130,9 +166,14 @@ class CheckMixIn:
            all packs. It also cross-checks the chunk index against the packs present in the
            repository to detect referenced but missing packs. Bit rot and other types of
            accidental damage can be detected this way, but as content-addressing is
-           not a MAC, this step does not detect tampering. Running the repository check can
+           not a MAC, this step does not detect tampering of the packs. The index objects
+           are also authenticated with the key when they are loaded for that cross-check.
+           A corrupt index ends the check after this step, as the archives check needs it,
+           unless ``--repair`` is given (see below). This step also verifies the repository
+           defaults object (see ``borg repo-create``): it must be present and authenticate
+           with the key. Running the repository check can
            be split into multiple partial checks using ``--max-duration``.
-           For rest:// repositories, the server computes the hashes, so the pack contents do
+           For ssh:// repositories, the server computes the hashes, so the pack contents do
            not have to travel over the network. For other remote backends, borg usually has
            to read (download) the objects to hash them.
 
@@ -140,8 +181,11 @@ class CheckMixIn:
            archive data (requires ``--verify-data``). This includes ensuring that the
            repository manifest exists, the archive metadata chunk is present, and that
            all chunks referencing files (items) in the archive exist. This requires
-           reading archive and file metadata, but not data. To scan for archives whose
-           entries were lost from the archive directory, pass ``--find-lost-archives``.
+           reading archive and file metadata, but not data. Without ``--repair``, this step
+           first reports the packs the chunk index references, but that are missing from
+           the repository; the objects stored in them are then reported as missing. To scan
+           for archives whose entries were lost from the archive directory, pass
+           ``--find-lost-archives``.
            It has to look at the metadata of every object in the repository (only for the
            archive metadata objects it finds that way, it also reads the object data), so
            it is very time-consuming for big repositories.
@@ -155,6 +199,10 @@ class CheckMixIn:
         repository checks only, or pass ``--archives-only`` to run the archive checks
         only.
 
+        ``borg check`` always needs the key, ``--repository-only`` included: it loads
+        the key (asking for the passphrase, if needed) before it checks anything and
+        aborts if the key can not be loaded.
+
         The ``--max-age`` option makes the check reuse the results of previous
         repository checks: packs whose intact result is younger than the given
         timespan (e.g. ``--max-age=4w`` or ``--max-age=12m``) are skipped, spreading
@@ -164,7 +212,13 @@ class CheckMixIn:
         ``1y``). Check results are recorded in any case; ``--max-age`` only controls
         their reuse. Packs recorded corrupt are always re-verified. ``--max-age``
         affects only the repository check and cannot be combined with
-        ``--archives-only`` or ``--repair``.
+        ``--archives-only``.
+
+        ``--repair`` reuses intact results in the same way. It always re-verifies the
+        packs recorded corrupt, which are the ones it salvages. With
+        ``--repository-only``, a corrupt repository index makes the repair verify every
+        pack and ignore ``--max-age``, because it rebuilds the index from the packs it
+        verified in that run.
 
         The ``--max-duration`` option splits a long-running repository check into
         several partial checks. After the given number of seconds, the check is
@@ -198,13 +252,18 @@ class CheckMixIn:
         which normal reads do not do by default (see ``BORG_ASSERT_ID``). Running it periodically
         is therefore recommended.
 
-        The ``--find-lost-archives`` option will also scan the whole repository, but
-        tells Borg to search for lost archive metadata. If Borg encounters any archive
-        metadata that does not match an archive directory entry (including
-        soft-deleted archives), it means that an entry was lost.
-        Unless ``borg compact`` is called, these archives can be fully restored with
-        ``--repair``. Please note that ``--find-lost-archives`` must look at every
-        object in the repository and is thus very time-consuming. You cannot use
+        With ``--repair``, ``--verify-data`` removes each chunk that fails the verification twice.
+        If the repository holds another copy of such a chunk and that copy passes the
+        verification, borg indexes it instead, so the archives referencing the chunk stay intact.
+
+        The ``--find-lost-archives`` option tells Borg to search for lost archive
+        metadata. If Borg encounters any archive metadata that does not match an
+        archive directory entry (including soft-deleted archives), it means that an
+        entry was lost. Unless ``borg compact`` is called, these archives can be fully
+        restored with ``--repair``. Without ``--verify-data``, ``--find-lost-archives``
+        reads the metadata of every object in the repository and is thus very
+        time-consuming. With ``--verify-data``, it reads only the archive metadata
+        objects that the data verification found. You cannot use
         ``--find-lost-archives`` with ``--repository-only``.
 
         You can influence how the archive part of the ``Analyzing archive ...`` output is
@@ -214,16 +273,18 @@ class CheckMixIn:
         If the ``borg check`` process receives a SIGINT signal (Ctrl-C), it stops at the
         next safe boundary, leaving the repository and its chunk index in a consistent state.
         The repository check stops after the current pack; ``--verify-data`` and
-        ``--find-lost-archives`` stop after the current chunk; a ``--repair`` archive check
-        stops between whole archives. Results recorded before the interrupt are kept, so a later
-        check does not re-verify those packs until they are due again. With ``--repair``, an
-        interrupted archive check may leave some archives already repaired and others not yet
-        processed, so run ``borg check --repair`` again to finish.
+        ``--find-lost-archives`` stop after the current chunk; the archive check stops after the
+        current archive item, with ``--repair`` between whole archives. Results recorded before
+        the interrupt are kept, so a later check does not re-verify those packs until they are
+        due again. With ``--repair``, an interrupted archive check may leave some archives already
+        repaired and others not yet processed, so run ``borg check --repair`` again to finish.
 
-        During a ``--repair`` run, the archive check first rebuilds the chunk index from the
-        packs, and, if the key must be recovered, scans chunks for it. These phases do not yet
-        respond to SIGINT, so on a large repository a Ctrl-C during them may appear to have no
-        effect until they finish.
+        ``borg check`` rebuilds the chunk index from the packs when ``--repair`` is given or when
+        the stored index cannot be used. Ctrl-C stops that rebuild after the current object and
+        discards the partial index: it lacks chunks that are still in the repository, so the check
+        would report them as lost. After a ``--repair`` that stored or deleted chunks, borg re-reads the
+        packs the repair wrote, makes the chunk index match them and stores it; that always runs to
+        completion, also after a Ctrl-C.
 
         About repair mode
         +++++++++++++++++
@@ -255,15 +316,24 @@ class CheckMixIn:
 
         In practice, repair mode hooks into both the repository and archive checks:
 
-        1. When checking the repository's consistency, repair mode rebuilds the repository
-           index from the packs if the index is corrupt, provided every pack matches its
-           store hash. If any pack fails its store hash, the repository check leaves the
-           index and the packs untouched and reports it; salvaging the intact objects of
-           such a pack is not implemented yet (refs #8572). The rebuild authenticates
-           each object's header and metadata with the key, leaves an object that fails
-           this out of the index and reports it as an error. Repair therefore always
-           needs the key, ``--repository-only`` included, and aborts if the key can not
-           be read.
+        1. When checking the repository's consistency, repair mode verifies the packs (all
+           of them, or with ``--max-age`` those without a recent intact result). It
+           salvages each pack that fails its store hash (a pack is named by the hash of its
+           content): the pack is replaced by one holding only its objects whose header,
+           metadata and data authenticate with the key, the rest is dropped and the index
+           entries of the dropped objects are removed. A pack in which no object
+           authenticates is left in place and reported. If the index is corrupt, a full
+           ``borg check --repair`` then rebuilds it from the packs in the archive check
+           (which does so on every ``--repair`` run). With ``--repository-only``, the
+           repository check rebuilds it, provided no pack is left corrupt. Either rebuild
+           authenticates each object's header and metadata with the key, leaves an object
+           that fails this out of the index and reports it as an error. Repair mode also
+           removes the index entries of the chunks stored in missing packs (packs the index
+           references, but that are absent from the repository). Only a full
+           ``borg check --repair`` repairs the archives that reference these chunks,
+           ``--repository-only`` does not.
+           A missing or corrupt repository defaults object is replaced by empty defaults, so
+           the repository can be used again; the commands then use the built-in defaults.
 
         2. When checking the consistency and correctness of archives, repair mode might
            remove whole archives from the manifest if their archive metadata chunk is

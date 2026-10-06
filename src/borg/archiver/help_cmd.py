@@ -324,7 +324,7 @@ class HelpMixIn:
         - aid: prefix match on the archive id (only one result allowed)
         - user: exact match on the username who created the archive
         - host: exact match on the hostname where the archive was created
-        - tags: match on the archive tags
+        - tags: match archives having all the given tags (comma-separated, e.g. tags:TAG1,TAG2)
         - date: match on the archive creation timestamp
 
         In case of a name pattern match,
@@ -399,8 +399,9 @@ class HelpMixIn:
             borg delete -a 'user:kenny'
             borg delete -a 'host:kenny-pc'
 
-            # tags match
+            # tags match (both lines match archives having TAG1 and TAG2)
             borg delete -a 'tags:TAG1' -a 'tags:TAG2'
+            borg delete -a 'tags:TAG1,TAG2'
 
             # archive creation date match
             borg delete -a 'date:2025-01'
@@ -486,7 +487,9 @@ class HelpMixIn:
         So if you use different compression specs for the backups, whichever stores a
         chunk first determines its compression. See also ``borg recreate``.
 
-        Compression is lz4 by default. If you want something else, you have to specify what you want.
+        If you do not specify a compression via ``--compression`` (or the environment or the
+        default config file), the repository's default compression is used, which can be set
+        with ``borg repo-create --compression``. Without a repository default, compression is lz4.
 
         Valid compression specifiers are:
 
@@ -494,7 +497,7 @@ class HelpMixIn:
             Do not compress.
 
         lz4
-            Use lz4 compression. Very high speed, very low compression. (default)
+            Use lz4 compression. Very high speed, very low compression. (built-in default)
 
         zstd[,L]
             Use zstd ("zstandard") compression, a modern wide-range algorithm.
@@ -605,21 +608,22 @@ class HelpMixIn:
                 Use this so you do not need to type ``--repo /path/to/my/repo`` all the time.
             BORG_OTHER_REPO
                 Similar to BORG_REPO, but gives the default for ``--other-repo``.
-            BORG_PASSPHRASE (and BORG_OTHER_PASSPHRASE)
+            BORG_PASSPHRASE (and BORG_NEW_PASSPHRASE, BORG_OTHER_PASSPHRASE)
                 When set, use the value to answer the passphrase question for encrypted repositories.
                 It is used when a passphrase is needed to access an encrypted repo as well as when a new
                 passphrase should be initially set when initializing an encrypted repo.
                 BORG_PASSPHRASE, BORG_PASSCOMMAND and BORG_PASSPHRASE_FD are mutually exclusive:
                 if more than one of them is set, borg refuses to guess and aborts with
                 "More than one passphrase environment variable is set". The same applies to the
-                ``BORG_OTHER_*`` variants (which are a separate, independent group).
+                ``BORG_NEW_*`` and ``BORG_OTHER_*`` variants (each of which is a separate,
+                independent group).
                 See also BORG_NEW_PASSPHRASE.
-                borg removes the passphrase-related variables (BORG_PASSPHRASE, BORG_NEW_PASSPHRASE,
-                BORG_PASSCOMMAND, BORG_PASSPHRASE_FD and their ``BORG_OTHER_*`` variants) as well as
+                borg removes the passphrase-related variables (BORG_PASSPHRASE, BORG_PASSCOMMAND,
+                BORG_PASSPHRASE_FD and their ``BORG_NEW_*`` and ``BORG_OTHER_*`` variants) as well as
                 BORGSTORE_REST_PASSWORD from the environment of the subprocesses it starts (like the
                 command given in BORG_PASSCOMMAND, ``--paths-from-command`` / ``--content-from-command``
                 commands, tar filter commands and ``borg with-lock`` commands).
-            BORG_PASSCOMMAND (and BORG_OTHER_PASSCOMMAND)
+            BORG_PASSCOMMAND (and BORG_NEW_PASSCOMMAND, BORG_OTHER_PASSCOMMAND)
                 When set, use the standard output of the command (trailing newlines are stripped) to answer the
                 passphrase question for encrypted repositories.
                 It is used when a passphrase is needed to access an encrypted repo as well as when a new
@@ -627,17 +631,19 @@ class HelpMixIn:
                 is executed without a shell. So variables, like ``$HOME`` will work, but ``~`` won't.
                 Mutually exclusive with BORG_PASSPHRASE and BORG_PASSPHRASE_FD, see there.
                 See also BORG_NEW_PASSPHRASE.
-            BORG_PASSPHRASE_FD (and BORG_OTHER_PASSPHRASE_FD)
+            BORG_PASSPHRASE_FD (and BORG_NEW_PASSPHRASE_FD, BORG_OTHER_PASSPHRASE_FD)
                 When set, specifies a file descriptor to read a passphrase
                 from. Programs starting borg may choose to open an anonymous pipe
                 and use it to pass a passphrase. This is safer than passing via
                 BORG_PASSPHRASE, because on some systems (e.g. Linux) environment
                 can be examined by other processes.
                 Mutually exclusive with BORG_PASSPHRASE and BORG_PASSCOMMAND, see there.
-            BORG_NEW_PASSPHRASE
-                When set, use the value to answer the passphrase question when a **new** passphrase is asked for.
-                This variable is checked first. If it is not set, BORG_PASSPHRASE, BORG_PASSCOMMAND and
-                BORG_PASSPHRASE_FD are checked (in that order).
+            BORG_NEW_PASSPHRASE (and BORG_NEW_PASSCOMMAND, BORG_NEW_PASSPHRASE_FD)
+                When set, use these to answer the passphrase question when a **new** passphrase is
+                asked for: like BORG_PASSPHRASE, BORG_PASSCOMMAND and BORG_PASSPHRASE_FD, but for
+                the new passphrase.
+                The ``BORG_NEW_*`` group is checked first. If none of its variables is set,
+                BORG_PASSPHRASE, BORG_PASSCOMMAND and BORG_PASSPHRASE_FD are checked (in that order).
                 Main use case for this is to fully automate ``borg key change-passphrase``.
             BORG_DISPLAY_PASSPHRASE
                 When set, use the value to answer the "display the passphrase for verification" question when defining a new passphrase for encrypted repositories.
@@ -665,6 +671,16 @@ class HelpMixIn:
             BORG_LOCK_WAIT
                 You can set the default value for the ``--lock-wait`` option with this, so
                 you do not need to give it as a command line option.
+            BORG_LOCK_RECHECK_DELAY
+                When acquiring the repository lock, borg creates its lock object, waits for this
+                many seconds (default: 0.01) and then lists the lock objects again to detect other
+                clients that created theirs at the same time. The default is fine for storage that
+                lists a new object immediately (local filesystems, sftp, ssh / rest, AWS S3, MinIO).
+                If your storage lists new objects only after a lag (e.g. NFS shared by several
+                clients, which caches directory listings, or some cloud storages used via rclone),
+                set this to at least that lag (e.g. 2 for a lag of up to 2 seconds) on all clients
+                using the repository, so that concurrent clients do not both get an exclusive lock.
+                See :ref:`storelocking`.
             BORG_LOGGING_CONF
                 When set, use the given filename as INI-style logging configuration (see
                 https://docs.python.org/3/library/logging.config.html#configuration-file-format).
@@ -697,7 +713,8 @@ class HelpMixIn:
                 second (default: 5). Fractional values are allowed, e.g.
                 ``BORG_PROGRESS_FPS=0.1`` limits it to one update every 10 seconds.
                 Lower values are useful when the output goes into a logfile rather than
-                to an interactive terminal.
+                to an interactive terminal. A percentage progress indicator always outputs
+                when it reaches 100%.
             BORG_SPINNER
                 Controls the spinner borg animates on a terminal while doing work of unknown
                 duration:

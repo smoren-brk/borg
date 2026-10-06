@@ -20,6 +20,7 @@ from ... import xattr, platform
 from ...archive import Archive
 from ...archiver import Archiver, PURE_PYTHON_MSGPACK_WARNING
 from ...constants import *  # NOQA
+from ...fuse_impl import llfuse
 from ...helpers import Location, umount
 from ...helpers import EXIT_SUCCESS
 from ...helpers import init_ec_warnings
@@ -27,7 +28,7 @@ from ...logger import flush_logging
 from ...manifest import Manifest
 from ...platform import get_flags
 from ...repository import Repository
-from .. import has_lchflags, has_mknod, is_utime_fully_supported, have_fuse_mtime_ns, st_mtime_ns_round, filter_xattrs
+from .. import has_lchflags, has_mknod, is_utime_fully_supported, st_mtime_ns_round, filter_xattrs
 from .. import changedir, ENOATTR  # NOQA
 from .. import are_symlinks_supported, are_hardlinks_supported, are_fifos_supported, granularity_sleep
 from ..platform.platform_test import is_win32
@@ -39,6 +40,9 @@ from ...xattr import get_all
 RK_ENCRYPTION = "--encryption=aes256-ocb"
 KF_ENCRYPTION = "--encryption=chacha20-poly1305"
 KF_LOCATION = "--key-location=keyfile"
+
+# Does this version of llfuse support ns precision?
+have_fuse_mtime_ns = hasattr(llfuse.EntryAttributes, "st_mtime_ns") if llfuse else False
 
 
 def set_empty_passphrase(monkeypatch):
@@ -140,7 +144,7 @@ def generate_archiver_tests(metafunc, kinds: str):
     #
     # Picking "kinds" (see #9324, testsuite speedup):
     # - "local" should always be included.
-    # - "remote" exercises the rest:// transport (it spawns a borgstore-server-rest subprocess and does
+    # - "remote" exercises the ssh:// transport (it spawns a "borg serve --rest" subprocess and does
     #   synchronous HTTP-over-stdio round trips per object), so a remote run costs several times its local
     #   twin. Only add "remote" where a backend genuinely branches its implementation per transport, and
     #   that branch is not already exercised by another remote-tested file:
@@ -241,11 +245,30 @@ def write_wrong_content_chunk(archive, repository, chunk_id, *, ro_type=ROBJ_FIL
     repository.flush()
 
 
+class KeyedRepository(Repository):
+    """A Repository that loads its key when it is opened, as the index/ and cache/ objects need it.
+
+    Tests use it to access a repository created by "borg repo-create" directly. The key is loaded with
+    key_factory, using the BORG_PASSPHRASE and BORG_KEYS_DIR the archiver fixture sets. Repository.open
+    loads it already when it locks the repository; this also loads it when opening without a lock.
+    """
+
+    def open(self, *args, **kwargs):
+        from ...crypto.key import key_factory, RepositoryKeyInfoMissing
+
+        result = super().open(*args, **kwargs)
+        try:
+            key_factory(self)  # sets the key, if open() did not already
+        except RepositoryKeyInfoMissing:
+            pass  # no key yet, e.g. a repository created without "borg repo-create"
+        return result
+
+
 def open_repository(archiver):
     if archiver.get_kind() == "remote":
-        return Repository(Location(archiver.repository_location), exclusive=True)
+        return KeyedRepository(Location(archiver.repository_location), exclusive=True)
     else:
-        return Repository(archiver.repository_path, exclusive=True)
+        return KeyedRepository(archiver.repository_path, exclusive=True)
 
 
 def create_regular_file(input_path, name, size=0, contents=None):

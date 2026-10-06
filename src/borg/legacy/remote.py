@@ -10,6 +10,7 @@ import sys
 import textwrap
 import time
 import traceback
+from collections import deque
 from subprocess import Popen, PIPE
 
 import borg.logger
@@ -25,6 +26,8 @@ from ..helpers import prepare_subprocess_env, ignore_sigint
 from ..fslocking import LockTimeout, NotLocked, NotMyLock, LockFailed
 from ..logger import create_logger, borg_serve_log_queue
 from ..helpers import msgpack
+from ..helpers import safe_encode
+from ..manifest import Manifest, NoManifestError
 from .repository import LegacyRepository
 from ..repository import Repository, StoreObjectNotFound
 from ..version import parse_version, format_version
@@ -37,6 +40,21 @@ BORG_VERSION = parse_version(__version__)
 MSGID, MSG, ARGS, RESULT, LOG = "i", "m", "a", "r", "l"
 
 MAX_INFLIGHT = 100
+
+# the RPC methods whose results are bytes (or tuples of bytes)
+BYTES_RESULT_METHODS = ("open", "get", "list", "scan", "load_key")
+
+
+def bytes_from_borg1(value):
+    """Convert a result of a borg 1.x server back to bytes (or a tuple of bytes).
+
+    borg 1.x packs bytes into the msgpack "raw" type, which we unpack to str (see helpers.msgpack).
+    """
+    if isinstance(value, str):
+        return safe_encode(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(bytes_from_borg1(v) for v in value)
+    return value
 
 
 class ConnectionClosed(Error):
@@ -224,6 +242,8 @@ class LegacyRemoteRepository:
         self.shutdown_time = None
         self.unpacker = get_limited_unpacker("client")
         self.server_version = None  # we update this after server sends its version
+        # borg 1.x servers do not have the info, close and get_manifest methods and they send bytes as str.
+        self.borg1_server = False
         self.p = None
         self._args = args
         if self.location.proto == "ssh":
@@ -273,6 +293,7 @@ class LegacyRemoteRepository:
                 self.server_version = version["server_version"]
             else:
                 raise Exception("Server insisted on using unsupported protocol version %s" % version)
+            self.borg1_server = self.server_version < parse_version("2.0.0a1")
 
             self.id = self.open(
                 path=self.location.path,
@@ -282,8 +303,11 @@ class LegacyRemoteRepository:
                 exclusive=exclusive,
                 v1_legacy=True,  # make remote use LegacyRepository
             )
-            info = self.info()
-            self.version = info["version"]
+            if self.borg1_server:
+                self.version = 1  # borg 1.x servers only serve v1 repositories.
+            else:
+                info = self.info()
+                self.version = info["version"]
 
         except Exception:
             self.close()
@@ -439,8 +463,8 @@ class LegacyRemoteRepository:
             else:
                 raise self.RPCError(unpacked)
 
-        calls = list(calls)
-        waiting_for = []
+        calls = deque(calls)
+        waiting_for = deque()
         send_buffer()  # Try to send data, as some cases (async_response) will never try to send data otherwise.
         try:
             while wait or calls:
@@ -456,9 +480,12 @@ class LegacyRemoteRepository:
                 while waiting_for:
                     try:
                         unpacked = self.responses.pop(waiting_for[0])
-                        waiting_for.pop(0)
+                        waiting_for.popleft()
                         handle_error(unpacked)
-                        yield unpacked[RESULT]
+                        result = unpacked[RESULT]
+                        if self.borg1_server and cmd in BYTES_RESULT_METHODS:
+                            result = bytes_from_borg1(result)
+                        yield result
                         if not waiting_for and not calls:
                             return
                     except KeyError:
@@ -539,7 +566,7 @@ class LegacyRemoteRepository:
                             _logger.warning("stderr: " + line.decode().strip())
                 if w:
                     while not self.to_send and calls and len(waiting_for) < MAX_INFLIGHT:
-                        args = calls.pop(0)
+                        args = calls.popleft()
                         self.msgid += 1
                         waiting_for.append(self.msgid)
                         self.to_send.push_back(msgpack.packb({MSGID: self.msgid, MSG: cmd, ARGS: args}))
@@ -592,6 +619,10 @@ class LegacyRemoteRepository:
         # note: legacy remote protocol does not support raise_missing parameter, so we ignore it here
         yield from self.call_many("get", [{"id": id, "read_data": read_data} for id in ids])
 
+    def gather_many(self, ids, raise_missing=True):
+        # a legacy repository has no packs, so this is just get_many (same interface as Repository).
+        return self.get_many(ids, raise_missing=raise_missing)
+
     @api(since=parse_version("1.0.0"))
     def put(self, id, data, wait=True):
         """actual remoting is done via self.call in the @api decorator"""
@@ -614,7 +645,9 @@ class LegacyRemoteRepository:
 
     def close(self):
         if self.p:
-            self.call("close", {}, wait=True)
+            if not self.borg1_server:
+                # borg 1.x servers close the repository when stdin gets closed, they have no close method.
+                self.call("close", {}, wait=True)
             self.p.stdin.close()
             self.p.stdout.close()
             self.p.wait()
@@ -624,18 +657,24 @@ class LegacyRemoteRepository:
         for resp in self.call_many("async_responses", calls=[], wait=True, async_wait=wait):
             return resp
 
-    @api(since=parse_version("2.0.0b8"))
     def get_manifest(self):
-        """actual remoting is done via self.call in the @api decorator"""
+        if not self.borg1_server:
+            return self.call("get_manifest", {})
+        # borg 1.x servers have no get_manifest method, so get the manifest object like LegacyRepository does.
+        try:
+            return self.get(Manifest.MANIFEST_ID)
+        except LegacyRepository.ObjectNotFound:
+            raise NoManifestError
 
     @api(since=parse_version("2.0.0b8"))
     def put_manifest(self, data):
         """actual remoting is done via self.call in the @api decorator"""
 
 
-# borg serve: borg only serves legacy (borg 1.x / v1) repositories over ssh:// now (current
-# repositories use rest://). The legacy client above (LegacyRemoteRepository) spawns "borg serve"
-# on the remote host; this server keeps the legacy RPC method allowlist and opens LegacyRepository.
+# borg serve (without --rest): serves legacy (borg 1.x / v1) repositories via the legacy RPC protocol
+# (current repositories are served via REST by "borg serve --rest"). The legacy client above
+# (LegacyRemoteRepository) spawns "borg serve" on the remote host; this server keeps the legacy RPC
+# method allowlist and opens LegacyRepository.
 
 
 class RepositoryServer:  # pragma: no cover
@@ -817,7 +856,7 @@ class RepositoryServer:  # pragma: no cover
         return path
 
     def open(self, path, create=False, lock_wait=None, lock=True, exclusive=None, v1_legacy=False):
-        # borg only serves legacy (v1) repositories now; current repositories are accessed via rest://.
+        # this server only serves legacy (v1) repositories; current repositories are served via REST.
         self.RepoCls = LegacyRepository
         self.rpc_methods = self._legacy_rpc_methods
         logging.debug("Resolving repository path %r", path)

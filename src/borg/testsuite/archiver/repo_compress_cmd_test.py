@@ -4,15 +4,16 @@ import re
 import pytest
 
 from ...constants import *  # NOQA
-from ...helpers import bin_to_hex, sig_int, Error, CompressionSpec
-from ...repository import Repository, PackReader, repo_lister
-from ...cache import list_chunkindex_hashes
+from ...helpers import bin_to_hex, hex_to_bin, sig_int, Error, CompressionSpec, IntegrityError
+from ...repository import Repository, PackReader, PackTracker, repo_lister
+from ...cache import list_chunkindex_hashes, write_chunkindex_to_repo
 from ...manifest import Manifest
 from ...compress import ZSTD, ZLIB, LZ4, CNONE
 from ...archiver.repo_compress_cmd import PackRecompressor
 
-from . import create_regular_file, cmd, RK_ENCRYPTION
-from ..repository_test import H, accept_all, fchunk, pdchunk
+from .. import make_test_key
+from . import create_regular_file, cmd, open_repository, RK_ENCRYPTION
+from ..repository_test import H, accept_all, fchunk, pdchunk, corrupt_chunk_on_disk
 
 
 def test_repo_compress(archiver):
@@ -226,7 +227,7 @@ def test_repo_compress_soft_interrupt_persists_valid_index(archiver, monkeypatch
             sig_int._sig_int_triggered = False  # reset the global flag for the following tests
 
     # a valid chunk index was persisted and every entry points at a pack that still exists
-    with Repository(archiver.repository_path, exclusive=True) as repository:
+    with open_repository(archiver) as repository:
         assert list_chunkindex_hashes(repository) != []
         pack_names_after = {info.name for info in repository.store_list("packs")}
         # one pack was rewritten before the stop, the remaining old packs are still there
@@ -237,6 +238,41 @@ def test_repo_compress_soft_interrupt_persists_valid_index(archiver, monkeypatch
     # a later run finishes the recompression of the remaining packs
     cmd(archiver, "repo-compress", "-C", "zstd,3")
     cmd(archiver, "check")
+
+
+@pytest.mark.parametrize("corrupt_ctype", (CNONE.ID, ZLIB.ID))
+def test_repo_compress_keeps_corrupt_pack(archiver, corrupt_ctype):
+    # repo-compress keeps a pack "borg check" recorded corrupt unchanged and warns (#10410).
+    # with "-C none", the corrupt object is either already stored as wanted (CNONE) or needs recompressing (ZLIB).
+    create_regular_file(archiver.input_path, "rand", contents=os.urandom(100_000))  # stored uncompressed
+    create_regular_file(archiver.input_path, "text", contents=b"z" * 100_000)  # stored zlib compressed
+    cmd(archiver, "repo-create", RK_ENCRYPTION)
+    cmd(archiver, "create", "test", "input", "-C", "zlib,3")
+    with open_repository(archiver) as repository:
+        manifest = Manifest.load(repository)
+        ctypes = {}  # pack_id -> {ctype, ...}
+        for id, entry in repository.chunks.iteritems():
+            meta = manifest.repo_objs.parse_meta(id, repository.get(id, read_data=False), ro_type=ROBJ_DONTCARE)
+            ctypes.setdefault(entry.pack_id, set()).add(meta["ctype"])
+            if meta["ctype"] == corrupt_ctype and meta["size"] == 100_000:
+                corrupt_id = id
+        corrupt_pack = repository.chunks[corrupt_id].pack_id
+        # the corrupt pack holds both objects, and another pack holds an object "-C none" recompresses.
+        assert ctypes.pop(corrupt_pack) >= {CNONE.ID, ZLIB.ID}
+        assert any(ZLIB.ID in pack_ctypes for pack_ctypes in ctypes.values())
+        packs_before = {info.name for info in repository.store_list("packs")}
+        corrupt_chunk_on_disk(repository, corrupt_id)  # corrupts the data, the metadata stays readable
+    cmd(archiver, "check", exit_code=1)
+
+    output = cmd(archiver, "repo-compress", "-v", "--stats", "-C", "none", exit_code=EXIT_WARNING)
+    assert '1 pack(s) recorded corrupt by "borg check" are not rewritten.' in output
+    assert 'Run "borg check --repair" to salvage them.' in output
+    assert "rewritten, 1 skipped (recorded corrupt)." in output
+    with open_repository(archiver) as repository:
+        packs_after = {info.name for info in repository.store_list("packs")}
+    assert bin_to_hex(corrupt_pack) in packs_after
+    assert len(packs_before - packs_after) >= 1  # other packs were recompressed
+    cmd(archiver, "check", exit_code=1)
 
 
 def transform_via(replacements):
@@ -253,7 +289,7 @@ def test_transform_pack_keeps_unindexed_gap(tmp_path):
     # must be carried into the transformed pack unchanged - recovering them is "borg check --repair"'s
     # job. also, the objects around them must be repointed correctly although their sizes changed.
     location = os.fspath(tmp_path / "repo")
-    with Repository(location, exclusive=True, create=True) as repository:
+    with Repository(location, exclusive=True, create=True, key_loader=make_test_key) as repository:
         repository._pack_writer.max_count = 3  # one flush() -> one pack
         for cid, data in [(H(0), b"WWWW"), (H(1), b"XXXX"), (H(2), b"YYYY")]:
             repository.put(cid, fchunk(data, chunk_id=cid))
@@ -289,7 +325,7 @@ def test_transform_pack_drops_superseded_gap(tmp_path):
     # a gap object whose chunk id the index maps to another location is a redundant, superseded
     # duplicate (equal ids mean equal content) - a transformed pack must not carry it forward.
     location = os.fspath(tmp_path / "repo")
-    with Repository(location, exclusive=True, create=True) as repository:
+    with Repository(location, exclusive=True, create=True, key_loader=make_test_key) as repository:
         repository._pack_writer.max_count = 2  # one flush() -> one pack
         # pack A: W and X; pack B: a second copy of X, which repoints the index to pack B,
         # leaving X's bytes in pack A as a superseded gap.
@@ -313,11 +349,67 @@ def test_transform_pack_drops_superseded_gap(tmp_path):
         assert pdchunk(repository.get(H(1))) == b"XXXX"  # the authoritative copy in pack B
 
 
+@pytest.mark.parametrize("untrusted", ("missing", "corrupt", "truncated", "overlap"))
+def test_repo_compress_keeps_duplicate_indexed_in_untrusted_pack(archiver, untrusted):
+    # X and Z are indexed in pack B, pack A holds another copy of X in a gap. With pack B missing from
+    # the store, recorded corrupt, truncated or with overlapping index entries, the copy in pack A may
+    # be the only readable one: repo-compress keeps it (#10474).
+    cmd(archiver, "repo-create", RK_ENCRYPTION)
+    with open_repository(archiver) as repository:
+        repo_objs = Manifest.load(repository).repo_objs
+        w, x, z = b"W" * 1000, b"X" * 1000, b"Z" * 1000
+        w_id, x_id, z_id = repo_objs.id_hash(w), repo_objs.id_hash(x), repo_objs.id_hash(z)
+        repository._pack_writer.max_count = 2  # one flush() -> one pack
+        for cid, data in [(w_id, w), (x_id, x)]:
+            repository.put(cid, repo_objs.format(cid, {}, data, ro_type=ROBJ_FILE_STREAM))
+        repository.flush()
+        pack_a = repository.chunks[w_id].pack_id
+        # repo-compress processes the packs in pack id order and stops with an error at a truncated
+        # pack or at one with overlapping index entries: pack A must be rewritten before, so pack B
+        # needs the higher pack id. The pack id depends on the random nonces of X and Z.
+        while True:
+            for cid, data in [(x_id, x), (z_id, z)]:
+                repository.put(cid, repo_objs.format(cid, {}, data, ro_type=ROBJ_FILE_STREAM))
+            repository.flush()
+            pack_b = repository.chunks[x_id].pack_id
+            key_b = "packs/" + bin_to_hex(pack_b)
+            if pack_b > pack_a:
+                break
+            repository.store_delete(key_b)
+        if untrusted == "missing":
+            repository.store_delete(key_b)
+        elif untrusted == "corrupt":
+            tracker = PackTracker.load(repository)
+            tracker.record(pack_b, False)
+            tracker.save()
+        elif untrusted == "truncated":
+            repository.store_store(key_b, repository.store_load(key_b)[:-1])
+        else:
+            chunks = repository.chunks
+            chunks[z_id] = chunks[z_id]._replace(obj_offset=chunks[x_id].obj_offset + 1)
+            write_chunkindex_to_repo(repository, chunks, incremental=False, force_write=True, delete_other=True)
+
+    if untrusted in ("truncated", "overlap"):
+        error = "object extends past end of file" if untrusted == "truncated" else "overlapping objects"
+        with pytest.raises(IntegrityError, match=error):
+            cmd(archiver, "repo-compress", "-C", "none")
+    else:
+        cmd(archiver, "repo-compress", "-C", "none", exit_code=EXIT_WARNING if untrusted == "corrupt" else 0)
+
+    with open_repository(archiver) as repository:
+        # the packs other than pack B: only the pack that replaced pack A.
+        (new_pack_hex,) = {info.name for info in repository.store_list("packs")} - {bin_to_hex(pack_b)}
+        assert new_pack_hex != bin_to_hex(pack_a)  # W was recompressed, pack A was rewritten
+        reader = PackReader(store=repository.store, pack_id=hex_to_bin(new_pack_hex))
+        # W and the gap copy of X are kept.
+        assert [chunk_id for chunk_id, _, _ in reader.iter_headers()] == [w_id, x_id]
+
+
 def test_transform_pack_unchanged_pack_untouched(tmp_path):
     # if every transform keeps its object, the store must not be touched at all:
     # no pack write, no pack delete, no before_change call.
     location = os.fspath(tmp_path / "repo")
-    with Repository(location, exclusive=True, create=True) as repository:
+    with Repository(location, exclusive=True, create=True, key_loader=make_test_key) as repository:
         repository._pack_writer.max_count = 2  # one flush() -> one pack
         for cid, data in [(H(0), b"WWWW"), (H(1), b"XXXX")]:
             repository.put(cid, fchunk(data, chunk_id=cid))

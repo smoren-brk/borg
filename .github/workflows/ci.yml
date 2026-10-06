@@ -282,7 +282,7 @@ jobs:
         sudo chmod o+x "$HOME"
         # Export SFTP test URL for tox via GITHUB_ENV
         echo "BORG_TEST_SFTP_REPO=sftp://sftpuser@localhost:22/borg/sftp-repo" >> $GITHUB_ENV
-        echo "BORG_TEST_REST_REPO=rest://sftpuser@localhost:22/borg/rest-repo" >> $GITHUB_ENV
+        echo "BORG_TEST_REST_REPO=ssh://sftpuser@localhost:22/borg/rest-repo" >> $GITHUB_ENV
 
     - name: Install and start moto S3 server (test only)
       # The S3 tests run against moto in server mode: it comes from PyPI (pinned in
@@ -323,7 +323,9 @@ jobs:
       run: |
         set -euxo pipefail
         rustc --version
-        pip install --no-binary cryptography cryptography
+        # --force-reinstall: the moto S3 test server install above already pulled in the
+        # cryptography wheel, without it pip would just keep that one.
+        pip install --force-reinstall --no-binary cryptography cryptography
         # check that the extension links the system OpenSSL dynamically and
         # loads the same version as the system's openssl program
         rust_ext=$(python -c 'import cryptography.hazmat.bindings._rust as m; print(m.__file__)')
@@ -438,7 +440,7 @@ jobs:
 
     - name: Upload test results to Codecov
       if: ${{ !cancelled() && !contains(matrix.toxenv, 'mypy') }}
-      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
       env:
         OS: ${{ runner.os }}
         python: ${{ matrix.python-version }}
@@ -450,7 +452,7 @@ jobs:
 
     - name: Upload coverage to Codecov
       if: ${{ !cancelled() && matrix.coverage }}
-      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
       env:
         OS: ${{ runner.os }}
         python: ${{ matrix.python-version }}
@@ -752,7 +754,7 @@ jobs:
 
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
-      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
       env:
         OS: ${{ runner.os }}
         python: ${{ env.PYTHON_VERSION }}
@@ -1022,6 +1024,17 @@ jobs:
               sudo python3 -m ensurepip
               sudo python3 -m pip install virtualenv
 
+              # illumos does not overcommit memory: fork() must reserve swap for the
+              # child's entire address space, so the big pytest workers sporadically
+              # fail to spawn subprocesses (borg serve, for the remote_archiver tests)
+              # with ENOMEM "[Errno 12] Not enough space" when the image's small swap
+              # is exhausted (the swap-backed tmpfs /tmp and a ZFS-ARC-squeezed
+              # availrmem eat into it, too). Add a sparse swap zvol so those
+              # reservations have room; it costs nothing unless actually paged to.
+              sudo zfs create -s -V 4G -b $(pagesize) -o primarycache=metadata rpool/swap2
+              sudo swap -a /dev/zvol/dsk/rpool/swap2
+              swap -lh && swap -sh
+
               # On omniOS /tmp is swap-backed tmpfs (small, RAM-bound), so the pip/cargo
               # build temps and the pytest temp tree quickly exhaust it ("no space left on
               # device"). /var/tmp is disk-backed (ZFS), so redirect TMPDIR there.
@@ -1053,6 +1066,14 @@ jobs:
               pkgman install -y lz4_devel openssl3_devel
               pkgman install -y rust_bin
 
+              # haiku r1beta6 corrupts data: a write() from a memory mapped file can silently
+              # store stale pages, see https://dev.haiku-os.org/ticket/20392. That breaks rust
+              # builds (rustc copies mapped object files into its .rlib archives). The shim
+              # replaces private file mappings by anonymous memory filled via pread(), we
+              # preload it into everything we run here.
+              gcc -O2 -Wall -shared -fPIC -o /boot/home/haiku_mmap_pread_shim.so scripts/haiku_mmap_pread_shim.c
+              export LD_PRELOAD=/boot/home/haiku_mmap_pread_shim.so
+
               python3 -m ensurepip --upgrade
               python3 -m pip install --upgrade pip wheel
               python3 -m venv .venv
@@ -1062,30 +1083,8 @@ jobs:
               export BORG_LIBLZ4_PREFIX=/system/develop
               export BORG_OPENSSL_PREFIX=/system/develop
 
-              # this VM corrupts data every now and then: rustc crashed on crate metadata it
-              # had written itself ("assertion failed: bytes[len] == STR_SENTINEL") and pip
-              # found sha256 mismatches reading big wheels back from its own cache. Build
-              # outside /boot/system/cache/tmp (haiku's /tmp) and run one rustc at a time,
-              # in case that corruption comes from disk or memory pressure.
-              export TMPDIR=/boot/home/borg-tmp
-              mkdir -p "$TMPDIR"
-              export CARGO_TARGET_DIR="$TMPDIR/cargo-target"
-              export CARGO_BUILD_JOBS=1
-
-              # retry a pip install that hit a corrupted file, dropping the cached (possibly
-              # corrupted) files first, so one of them does not fail the whole job - and does
-              # not end up in the actions cache, failing every following run, too.
-              pip_install() {
-                for attempt in 1 2 3; do
-                  pip install "$@" && return 0
-                  echo "*** pip install failed (attempt $attempt), purging the pip cache and retrying ***"
-                  pip cache purge || true
-                done
-                return 1
-              }
-
-              pip_install -r requirements.d/development.lock.txt
-              pip_install -e .
+              pip install -r requirements.d/development.lock.txt
+              pip install -e .
 
               # troubles with either tox or pytest xdist, so we run pytest manually:
               pytest -v -n auto -rs --cov=borg --cov-config=pyproject.toml --cov-report=xml --junitxml=test-results.xml --benchmark-skip -k "not remote and not socket"
@@ -1131,7 +1130,7 @@ jobs:
 
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         env:
           OS: ${{ matrix.os }}
         with:
@@ -1142,7 +1141,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         env:
           OS: ${{ matrix.os }}
         with:
@@ -1204,7 +1203,7 @@ jobs:
           restore-keys: |
             windows-msys2-pip-
 
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2.32.0
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2.33.0
         with:
           msystem: UCRT64
           update: true
@@ -1300,7 +1299,7 @@ jobs:
 
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         env:
           OS: ${{ runner.os }}
           python: '3.11'
@@ -1312,7 +1311,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         env:
           OS: ${{ runner.os }}
           python: '3.11'

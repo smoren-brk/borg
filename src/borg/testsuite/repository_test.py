@@ -1,4 +1,5 @@
 import io
+import json
 import logging
 import os
 import struct
@@ -8,38 +9,49 @@ from collections import namedtuple
 
 import pytest
 from borghash import HashTableNT
+from borgstore.backends.errors import BackendConnectionError, BackendMustBeOpen, PermissionDenied, ReadRangeError
+from borgstore.backends.rest import REST
 
 from ..crypto.key import store_hash
 from .. import repository as repository_module
 from ..cache import chunkindex_is_invalid, delete_chunkindex_from_repo, write_chunkindex_invalid
 from ..compress import CNONE
 from ..constants import MAX_CLOCK_SKEW, ROBJ_FILE_STREAM
-from ..crypto.key import CHPOKey
-from ..helpers import IntegrityError, Location, bin_to_hex
+from ..crypto.key import AESOCBKey, AuthenticatedKey, Blake3AuthenticatedKey, CHPOKey
+from ..helpers import Error, IntegrityError, Location, bin_to_hex, hex_to_bin
 from ..hashindex import ChunkIndex, ChunkIndexEntry
+from ..platform import get_process_id
 from ..repository import Repository, MAX_DATA_SIZE, MAX_VALIDATED_META_SIZE, propagate_rsh, rest_serve_command
 from ..repository import PackWriter, PackReader, PackTracker, superseded_gap_ranges
-from ..repoobj import RepoObj, OBJ_MAGIC, OBJ_VERSION, object_validator
-from . import make_test_key
+from ..repository import SALVAGE_DONE, SALVAGE_INTACT, SALVAGE_NOTHING_AUTHENTICATES
+from ..repository import SALVAGE_READ_ERROR, SALVAGE_READS_DIFFER, StoreObjectNotFound
+from ..repoobj import RepoObj, OBJ_MAGIC, OBJ_VERSION, object_validator, whole_object_authenticator
+from . import make_test_key, set_test_key_on_open
 from .hashindex_test import H
 from .repoobj_test import CHUNK_ID_OFFSET, DATA_SIZE_OFFSET, META_SIZE_OFFSET
 
 
+@pytest.fixture(autouse=True)
+def use_test_key_on_open(monkeypatch):
+    # the index/ and cache/ objects need a key, see Repository.set_key.
+    set_test_key_on_open(monkeypatch)
+
+
 def test_rest_serve_command_local():
-    # rest:// without a host runs "borg serve --rest" locally, talking over stdio.
-    cmd = rest_serve_command(Location("rest:////tmp/repo"))
+    # ssh:// with the special host "__testsuite__" runs "borg serve --rest" locally, talking over stdio.
+    cmd = rest_serve_command(Location("ssh://__testsuite__//tmp/repo"))
     assert "ssh" not in cmd
     assert cmd[0] == sys.executable
     assert cmd[-4:] == ["serve", "--rest", "--backend", "FILE:/tmp/repo"]
 
 
 def test_rest_serve_command_ssh(monkeypatch):
-    # rest:// with a host is reached via ssh, running "borg serve --rest" remotely.
+    # ssh:// with a host is reached via ssh, running "borg serve --rest" remotely.
     # we override BORGSTORE_RSH to a simple "ssh" here to simplify testing.
     # without that, borgstore 0.5.5+ would also set some ssh options via cmdline.
     monkeypatch.setenv("BORGSTORE_RSH", "ssh")
     monkeypatch.delenv("BORG_REMOTE_PATH", raising=False)
-    cmd = rest_serve_command(Location("rest://user@host/repo/path"))
+    cmd = rest_serve_command(Location("ssh://user@host/repo/path"))
     assert cmd[:2] == ["ssh", "user@host"]
     assert cmd[-5:] == ["borg", "serve", "--rest", "--backend", "FILE:repo/path"]
 
@@ -61,15 +73,65 @@ def test_propagate_rsh(monkeypatch):
     assert "BORGSTORE_RSH" not in os.environ
 
 
-@pytest.mark.parametrize("proto", ["file", "rest"])
+@pytest.mark.parametrize("v1_legacy", [False, True])
+def test_get_repository_ssh(monkeypatch, v1_legacy):
+    # ssh:// is a current repository served via REST, or a legacy repository with --from-borg1 (#9765).
+    from ..archiver._common import get_repository
+    from ..legacy import remote as legacy_remote
+
+    class FakeLegacyRemoteRepository:
+        def __init__(self, location, **kw):
+            self._location = location
+
+    monkeypatch.setattr(legacy_remote, "LegacyRemoteRepository", FakeLegacyRemoteRepository)
+    location = Location("ssh://user@host/repo/path")
+    repository = get_repository(
+        location, create=False, exclusive=False, lock_wait=1, lock=True, args=None, v1_legacy=v1_legacy
+    )
+    assert type(repository) is (FakeLegacyRemoteRepository if v1_legacy else Repository)
+    assert repository._location is location
+
+
+@pytest.mark.parametrize("proto", ["file", "ssh"])
 def test_open_nonexistent_repository(tmp_path, proto):
-    # A missing repository raises Repository.DoesNotExist, also via the rest:// transport (#10365).
+    # A missing repository raises Repository.DoesNotExist, also via the ssh:// transport (#10365).
     path = os.fspath(tmp_path / "nonexistent")
-    location = Location(path if proto == "file" else f"rest:///{path}")
+    location = Location(path if proto == "file" else f"ssh://__testsuite__/{path}")
     with pytest.raises(Repository.DoesNotExist):
         with Repository(location, exclusive=True):
             pass
     assert not os.path.exists(path)
+
+
+@pytest.mark.parametrize("create", [False, True])
+def test_remote_serve_fails_to_start(tmp_path, monkeypatch, create):
+    # e.g. a borg 1.x "borg serve" on the remote host does not know --rest: the user gets an error
+    # showing the server's stderr and a hint, not a traceback of the dead store's close().
+    def failing_rest_backend(location):
+        error = "borg serve: error: unrecognized arguments: --rest"
+        command = [sys.executable, "-c", f"import sys; sys.stderr.write({error!r} + '\\n'); sys.exit(2)"]
+        # no waiting between the reconnect attempts, to keep the test fast.
+        return REST(base_url="http://stdio-backend", command=command, reconnect_wait=0)
+
+    monkeypatch.setattr(repository_module, "build_rest_backend", failing_rest_backend)
+    location = Location("ssh://__testsuite__/" + os.fspath(tmp_path / "repository"))
+    with pytest.raises(Error, match="use --from-borg1") as exc_info:
+        with Repository(location, exclusive=True, create=create):
+            pass
+    assert "unrecognized arguments: --rest" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("proto", ["file", "ssh"])
+def test_open_legacy_repository(tmp_path, proto):
+    # A borg 1.x repository (config is a file, not the config/ namespace) raises Repository.LegacyRepository.
+    path = tmp_path / "v1repo"
+    (path / "data").mkdir(parents=True)
+    (path / "config").write_text("[repository]\nversion = 1\nsegments_per_dir = 1000\nid = 00\n")
+    (path / "README").write_text("This is a Borg Backup repository.\n")
+    location = Location(os.fspath(path) if proto == "file" else f"ssh://__testsuite__/{os.fspath(path)}")
+    with pytest.raises(Repository.LegacyRepository):
+        with Repository(location, exclusive=True):
+            pass
 
 
 @pytest.fixture()
@@ -136,6 +198,16 @@ def pdchunk(chunk):
 def validate_any(chunk_id, obj):
     # A validator for check(repair=True) that accepts every object.
     return True
+
+
+class Interrupter:
+    """A stand-in for the global sig_int flag whose truth value a test flips mid-loop."""
+
+    def __init__(self):
+        self.triggered = False
+
+    def __bool__(self):
+        return self.triggered
 
 
 def test_basic_operations(repo_fixtures, request):
@@ -411,6 +483,18 @@ def test_read_data(repo_fixtures, request):
         assert repository.get(H(0), read_data=False) == chunk_short
 
 
+def test_flush_returns_the_stored_objects(repository):
+    assert repository.flush() is None  # not opened, no pack writer
+    with repository:
+        assert repository.flush() is None  # nothing buffered
+        repository.put(H(0), fchunk(b"foo"))
+        ((chunk_id, pack_id, obj_offset, obj_size),) = repository.flush()
+        entry = repository.chunks[H(0)]
+        assert (chunk_id, pack_id, obj_offset, obj_size) == (H(0), entry.pack_id, entry.obj_offset, entry.obj_size)
+        assert repository.flush() is None
+    assert repository.flush() is None  # closed
+
+
 def test_consistency(repo_fixtures, request):
     with get_repository_from_fixture(repo_fixtures, request) as repository:
         repository.put(H(0), fchunk(b"foo"))
@@ -592,6 +676,25 @@ def test_get_many_keeps_request_order(repo_fixtures, request):
         assert repository.store.stats["load_calls"] - loads_before == 2  # each pack loaded once
 
 
+def test_clear_pack_cache(repo_fixtures, request):
+    # clear_pack_cache() drops the packs get_many() cached, so the next read loads them again.
+    objects = [(H(i), fchunk(b"payload-%02d" % i, chunk_id=H(i))) for i in range(2)]
+    with get_repository_from_fixture(repo_fixtures, request) as repository:
+        repository._pack_writer.max_count = 2  # one pack: {H0, H1}
+        for chunk_id, chunk in objects:
+            repository.put(chunk_id, chunk)
+        repository.flush()
+        assert len(list(repository.get_many([H(0)]))) == 1  # loads the pack into the cache
+
+        loads_before = repository.store.stats["load_calls"]
+        assert repository.get(H(1)) == objects[1][1]  # sliced out of the cached pack
+        assert repository.store.stats["load_calls"] == loads_before
+
+        repository.clear_pack_cache()
+        assert repository.get(H(1)) == objects[1][1]  # same bytes, read from the store again
+        assert repository.store.stats["load_calls"] > loads_before
+
+
 def test_get_many_missing_id_yields_none(repo_fixtures, request):
     # With raise_missing=False, an id that was never stored yields None in its position; the ids
     # before and after it read back unchanged.
@@ -689,6 +792,110 @@ def test_get_reuses_cached_pack(repo_fixtures, request):
         meta_only = repository.get(H(1), read_data=False)
         assert meta_only and isinstance(meta_only, bytes)  # read_data=False returns header+meta bytes
         assert repository.store.stats["load_calls"] - loads_before == 0
+
+
+@pytest.mark.parametrize("variant", ["file", "ssh", "storecache"])
+def test_gather_many_one_gather_for_many_packs(tmp_path, monkeypatch, variant):
+    # gather_many reads objects from several packs with one store.gather call and no store.load, in the
+    # requested order, including repeated ids. Via ssh:// the REST backend gathers on the server side; with a
+    # store cache (writethrough on packs/), store.gather reads the ranges through the cache.
+    path = os.fspath(tmp_path / "repository")
+    if variant == "storecache":
+        monkeypatch.setenv("BORG_STORE_CACHE", os.fspath(tmp_path / "storecache"))
+    location = Location(f"ssh://__testsuite__/{path}" if variant == "ssh" else path)
+    objects = {H(i): fchunk(b"payload-%02d" % i, chunk_id=H(i)) for i in range(5)}
+    with Repository(location, exclusive=True, create=True) as repository:
+        repository._pack_writer.max_count = 2  # three packs: {H0,H1} {H2,H3} {H4}
+        for chunk_id, chunk in objects.items():
+            repository.put(chunk_id, chunk)
+        repository.flush()
+        assert len({repository.chunks[chunk_id].pack_id for chunk_id in objects}) == 3
+        ids = [H(4), H(0), H(2), H(0), H(1), H(3)]  # out of stored order, across all packs, H0 repeated
+
+        gathers_before = repository.store.stats["gather_calls"]
+        loads_before = repository.store.stats["load_calls"]
+        assert list(repository.gather_many(ids)) == [objects[chunk_id] for chunk_id in ids]
+        assert repository.store.stats["gather_calls"] - gathers_before == 1
+        assert repository.store.stats["load_calls"] == loads_before
+
+
+def test_gather_many_batches(repo_fixtures, request, monkeypatch):
+    # gather_many ends a batch at GATHER_MAX_COUNT objects or once a batch has GATHER_MAX_SIZE bytes.
+    objects = {H(i): fchunk(b"payload-%02d" % i, chunk_id=H(i)) for i in range(5)}
+    with get_repository_from_fixture(repo_fixtures, request) as repository:
+        repository._pack_writer.max_count = 1  # one pack per object
+        for chunk_id, chunk in objects.items():
+            repository.put(chunk_id, chunk)
+        repository.flush()
+        ids = list(objects)
+        expected = list(objects.values())
+
+        monkeypatch.setattr(repository, "GATHER_MAX_COUNT", 2)
+        gathers_before = repository.store.stats["gather_calls"]
+        assert list(repository.gather_many(ids)) == expected
+        assert repository.store.stats["gather_calls"] - gathers_before == 3  # batches of 2, 2 and 1 objects
+
+        monkeypatch.setattr(repository, "GATHER_MAX_COUNT", 1000)
+        monkeypatch.setattr(repository, "GATHER_MAX_SIZE", 2 * len(expected[0]))
+        gathers_before = repository.store.stats["gather_calls"]
+        assert list(repository.gather_many(ids)) == expected
+        assert repository.store.stats["gather_calls"] - gathers_before == 3  # batches of 2, 2 and 1 objects
+
+
+def test_gather_many_missing_id(repo_fixtures, request):
+    # An id that was never stored yields None with raise_missing=False and raises ObjectNotFound otherwise;
+    # the other ids of the batch read back unchanged.
+    objects = {H(i): fchunk(b"payload-%02d" % i, chunk_id=H(i)) for i in range(2)}
+    with get_repository_from_fixture(repo_fixtures, request) as repository:
+        for chunk_id, chunk in objects.items():
+            repository.put(chunk_id, chunk)
+        repository.flush()
+        ids = [H(0), H(99), H(1)]  # H(99) was never put
+        assert list(repository.gather_many(ids, raise_missing=False)) == [objects[H(0)], None, objects[H(1)]]
+        with pytest.raises(Repository.ObjectNotFound):
+            list(repository.gather_many(ids))
+
+
+def test_gather_many_missing_pack(repo_fixtures, request):
+    # A pack missing from the store fails the store.gather of its batch; gather_many then reads the batch's
+    # objects one by one with get(): the objects in intact packs are returned, the missing one yields None
+    # with raise_missing=False and raises ObjectNotFound otherwise.
+    objects = {H(i): fchunk(b"payload-%02d" % i, chunk_id=H(i)) for i in range(2)}
+    with get_repository_from_fixture(repo_fixtures, request) as repository:
+        repository._pack_writer.max_count = 1  # two packs: {H0} {H1}
+        for chunk_id, chunk in objects.items():
+            repository.put(chunk_id, chunk)
+        repository.flush()
+        repository.store_delete("packs/" + bin_to_hex(repository.chunks[H(0)].pack_id))  # keep its index entry
+
+        assert list(repository.gather_many([H(0), H(1)], raise_missing=False)) == [None, objects[H(1)]]
+        with pytest.raises(Repository.ObjectNotFound):
+            list(repository.gather_many([H(0), H(1)]))
+
+
+def test_gather_many_uses_cached_pack(repo_fixtures, request):
+    # Objects of a pack that get_many already cached are sliced from it, without a store.gather call.
+    objects = {H(i): fchunk(b"payload-%02d" % i, chunk_id=H(i)) for i in range(2)}
+    with get_repository_from_fixture(repo_fixtures, request) as repository:
+        repository._pack_writer.max_count = 2  # one pack: {H0, H1}
+        for chunk_id, chunk in objects.items():
+            repository.put(chunk_id, chunk)
+        repository.flush()
+        list(repository.get_many([H(0)]))  # loads the whole pack into the cache
+
+        gathers_before = repository.store.stats["gather_calls"]
+        assert list(repository.gather_many([H(0), H(1)])) == list(objects.values())
+        assert repository.store.stats["gather_calls"] == gathers_before
+
+
+def test_gather_many_inflight_pack(repo_fixtures, request):
+    # Objects of a pack whose background store may still be in flight are read via get(), which joins it.
+    objects = {H(i): fchunk(b"payload-%02d" % i, chunk_id=H(i)) for i in range(2)}
+    with get_repository_from_fixture(repo_fixtures, request) as repository:
+        repository._pack_writer.max_count = 2  # the second put fills the pack and hands it to the store-thread
+        for chunk_id, chunk in objects.items():
+            repository.put(chunk_id, chunk)
+        assert list(repository.gather_many([H(0), H(1)])) == list(objects.values())
 
 
 def build_one_pack(repository, objects):
@@ -1027,6 +1234,164 @@ def test_assert_writable(repository):
             repository.assert_writable()
 
 
+STORE_OBJ_KEY_CLASSES = [AESOCBKey, CHPOKey, AuthenticatedKey, Blake3AuthenticatedKey]
+ENCRYPTING_KEY_CLASSES = (AESOCBKey, CHPOKey)
+
+
+def make_store_obj_key(key_class, repository):
+    key = key_class(repository)
+    key.init_from_random_data()
+    key.init_ciphers()
+    return key
+
+
+@pytest.mark.parametrize("key_class", STORE_OBJ_KEY_CLASSES)
+def test_store_encrypt_store_roundtrip(repository, key_class):
+    payload = b"some index or cache content " * 10
+    with repository:
+        repository.set_key(make_store_obj_key(key_class, repository))
+        assert repository.store_encrypt_store("cache/test", payload) == "cache/test"
+        assert bytes(repository.store_load_decrypt("cache/test")) == payload
+        name = repository.store_encrypt_store("index", payload, hashed_name=True)
+        namespace, hex_hash = name.split("/")
+        assert namespace == "index" and len(hex_hash) == 64
+        assert store_hash(repository.store_load(name)).hexdigest() == hex_hash
+        assert bytes(repository.store_load_decrypt(name, hashed_name=True)) == payload
+
+
+@pytest.mark.parametrize("key_class", STORE_OBJ_KEY_CLASSES)
+def test_store_encrypt_store_payload_visibility(repository, key_class):
+    # The encrypting modes hide the payload and give each envelope a new name, the authenticated-*
+    # modes store the payload in the clear and give the same payload the same name.
+    payload = b"a well-known payload " * 10
+    with repository:
+        repository.set_key(make_store_obj_key(key_class, repository))
+        name1 = repository.store_encrypt_store("index", payload, hashed_name=True)
+        name2 = repository.store_encrypt_store("index", payload, hashed_name=True)
+        stored = repository.store_load(name1)
+        if issubclass(key_class, ENCRYPTING_KEY_CLASSES):
+            assert payload not in stored
+            assert name1 != name2
+        else:
+            assert payload in stored
+            assert name1 == name2
+
+
+@pytest.mark.parametrize("key_class", STORE_OBJ_KEY_CLASSES)
+def test_store_load_decrypt_detects_tampering(repository, key_class):
+    payload = b"some cache content " * 10
+    with repository:
+        repository.set_key(make_store_obj_key(key_class, repository))
+        # a flipped byte fails the authentication.
+        repository.store_encrypt_store("cache/a", payload)
+        stored = bytearray(repository.store_load("cache/a"))
+        stored[-1] ^= 0x01
+        repository.store_store("cache/a", bytes(stored))
+        with pytest.raises(IntegrityError):
+            repository.store_load_decrypt("cache/a")
+        # an object moved to another name fails, the name is bound into the envelope.
+        repository.store_encrypt_store("cache/b", payload)
+        repository.store_move("cache/b", "cache/c")
+        with pytest.raises(IntegrityError):
+            repository.store_load_decrypt("cache/c")
+        # same for a copy stored under another name.
+        repository.store_encrypt_store("cache/d", payload)
+        repository.store_store("cache/e", repository.store_load("cache/d"))
+        with pytest.raises(IntegrityError):
+            repository.store_load_decrypt("cache/e")
+        # a hashed-name object in another namespace fails (the namespace is the AAD).
+        name = repository.store_encrypt_store("index", payload, hashed_name=True)
+        other_name = "cache/" + name.split("/")[1]
+        repository.store_store(other_name, repository.store_load(name))
+        with pytest.raises(IntegrityError):
+            repository.store_load_decrypt(other_name, hashed_name=True)
+
+
+def test_store_load_decrypt_error_message(repository):
+    with repository:
+        repository.set_key(make_store_obj_key(AESOCBKey, repository))
+        repository.store_store("cache/test", b"not an envelope")
+        with pytest.raises(IntegrityError) as excinfo:
+            repository.store_load_decrypt("cache/test")
+        assert str(excinfo.value) == "Data integrity error: Store object cache/test: authentication failed"
+
+
+@pytest.mark.parametrize("key_class", STORE_OBJ_KEY_CLASSES)
+def test_store_load_decrypt_bound_to_the_repository(tmp_path, key_class):
+    # an object copied from another repository with the same key fails: the repository id is in the AAD.
+    with Repository(os.fspath(tmp_path / "repo1"), exclusive=True, create=True) as repository1:
+        key = make_store_obj_key(key_class, repository1)
+        repository1.set_key(key)
+        cache_data = repository1.store_load(repository1.store_encrypt_store("cache/test", b"payload"))
+        index_name = repository1.store_encrypt_store("index", b"payload", hashed_name=True)
+        index_data = repository1.store_load(index_name)
+    with Repository(os.fspath(tmp_path / "repo2"), exclusive=True, create=True) as repository2:
+        repository2.set_key(key)
+        repository2.store_store("cache/test", cache_data)
+        repository2.store_store(index_name, index_data)
+        with pytest.raises(IntegrityError, match="authentication failed"):
+            repository2.store_load_decrypt("cache/test")
+        with pytest.raises(IntegrityError, match="authentication failed"):
+            repository2.store_load_decrypt(index_name, hashed_name=True)
+
+
+@pytest.mark.parametrize("key_class", STORE_OBJ_KEY_CLASSES)
+def test_store_obj_aad_keeps_names_and_namespaces_apart(repository, key_class):
+    # the envelope of a hashed-name object in the namespace "index" does not authenticate as the object
+    # named "index", and vice versa (the AAD tags them differently).
+    with repository:
+        key = make_store_obj_key(key_class, repository)
+        repository.set_key(key)
+        assert repository._store_obj_aad("index", True) != repository._store_obj_aad("index", False)
+        envelope = repository.store_load(repository.store_encrypt_store("index", b"payload", hashed_name=True))
+        with pytest.raises(IntegrityError):
+            key.decrypt(b"", envelope, aad=repository._store_obj_aad("index", False))
+        envelope = key.encrypt(b"", b"payload", aad=repository._store_obj_aad("index", False))
+        repository.store_store("index/" + store_hash(envelope).hexdigest(), envelope)
+        with pytest.raises(IntegrityError):
+            repository.store_load_decrypt("index/" + store_hash(envelope).hexdigest(), hashed_name=True)
+
+
+def test_store_encrypt_store_without_a_key(repository):
+    with repository:
+        repository.set_key(None)  # undo use_test_key_on_open
+        with pytest.raises(Repository.KeyRequired) as excinfo:
+            repository.store_encrypt_store("cache/test", b"payload")
+        assert excinfo.value.exit_mcode == 28
+        with pytest.raises(Repository.KeyRequired):
+            repository.store_encrypt_store("index", b"payload", hashed_name=True)
+        assert repository.store_list("cache") == []
+        repository.store_store("cache/test", b"payload")
+        with pytest.raises(Repository.KeyRequired):
+            repository.store_load_decrypt("cache/test")
+
+
+@pytest.mark.parametrize("key_class", [AESOCBKey, CHPOKey])
+def test_lock_objects_are_sealed(repository, key_class):
+    # the lock objects are in the envelope of the repository's key, bound to the repository and to locks/.
+    key = make_store_obj_key(key_class, repository)
+    repository.set_key(key)  # before opening it: locking the repository needs the key
+    with repository:
+        (info,) = repository.store_list("locks")
+        content = bytes(repository.store_load(f"locks/{info.name}"))
+        hostid, pid, _ = get_process_id()
+        assert hostid.encode() not in content and str(pid).encode() not in content
+        assert info.name == store_hash(content).hexdigest()
+        lock = json.loads(key.decrypt(b"", content, aad=repository._store_obj_aad("locks", True)))
+        assert (lock["hostid"], lock["processid"]) == (hostid, pid)
+        with pytest.raises(IntegrityError):  # not valid as an object of another namespace
+            key.decrypt(b"", content, aad=repository._store_obj_aad("index", True))
+
+
+def test_store_load_decrypt_missing_object(repository):
+    with repository:
+        repository.set_key(make_test_key(repository))
+        with pytest.raises(repository_module.StoreObjectNotFound):
+            repository.store_load_decrypt("cache/missing")
+        with pytest.raises(repository_module.StoreObjectNotFound):
+            repository.store_load_decrypt("index/" + "0" * 64, hashed_name=True)
+
+
 def test_list(repo_fixtures, request):
     with get_repository_from_fixture(repo_fixtures, request) as repository:
         for x in range(100):
@@ -1286,6 +1651,38 @@ def test_get_read_data_false_large_meta(tmp_path):
         assert result == chunk[: hdr_size + len(big_meta)]
 
 
+@pytest.mark.parametrize(
+    "damage, problem",
+    [
+        ("truncated", "object too small: expected at least 49 header bytes, got 48 bytes"),
+        ("magic", "no object header"),
+        ("version", "unsupported object version 238"),
+        ("truncated_meta", "object too small: expected 4 metadata bytes, got 2 bytes"),
+    ],
+    ids=["truncated", "magic", "version", "truncated_meta"],
+)
+def test_get_read_data_false_rejects_damaged_object(tmp_path, damage, problem):
+    # get(read_data=False) raises IntegrityError for an invalid header or truncated metadata.
+    chunk = bytearray(fchunk(b"DATA", meta=b"META"))
+    if damage == "truncated":
+        chunk = chunk[: RepoObj.obj_header.size - 1]
+    elif damage == "truncated_meta":
+        chunk = chunk[: RepoObj.obj_header.size + 2]
+    elif damage == "magic":
+        chunk[0] ^= 0xFF
+    else:
+        chunk[len(OBJ_MAGIC)] = 0xEE  # version byte
+    pack_id, chunk_id = H(45), H(50)
+    with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
+        repository.store_store("packs/" + bin_to_hex(pack_id), bytes(chunk))
+        chunks = ChunkIndex()
+        chunks.add(chunk_id, len(chunk))
+        chunks.update_pack_info([(chunk_id, pack_id, 0, len(chunk))])
+        repository.chunks = chunks
+        with pytest.raises(IntegrityError, match=f": {problem} \\[id {bin_to_hex(chunk_id)}\\]$"):
+            repository.get(chunk_id, read_data=False)
+
+
 def test_get_uses_chunk_index_location(tmp_path):
     # get() routes to the correct pack and offset when a ChunkIndex is assigned via the chunks property.
     chunk1 = fchunk(b"FIRST")
@@ -1359,8 +1756,9 @@ def test_flush_store_failure_drops_pending_entries(tmp_path):
 
 
 def _serialized_chunkindex():
-    # Serialize an empty ChunkIndex to bytes, as stored under index/<store_hash(content)>. check() parses
-    # index fragments, so a fragment must be a real ChunkIndex serialization.
+    # Serialize an empty ChunkIndex to bytes, the plaintext of an index/ fragment (see
+    # store_encrypt_store). check() parses index fragments, so a fragment must be a real ChunkIndex
+    # serialization.
     with io.BytesIO() as f:
         ChunkIndex().write(f)
         return f.getvalue()
@@ -1386,13 +1784,11 @@ def test_check_detects_corruption_in_later_object(tmp_path):
 
 def test_check_detects_index_corruption(tmp_path):
     # index/ objects are named by store_hash(content) like packs, so check verifies them the same way.
-    content = _serialized_chunkindex()
-    index_name = "index/" + store_hash(content).hexdigest()
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
-        repository.store_store(index_name, content)
+        index_name = repository.store_encrypt_store("index", _serialized_chunkindex(), hashed_name=True)
         assert repository.check(repair=False) is True  # index object intact (name == store_hash(content))
 
-        corrupted = bytearray(content)
+        corrupted = bytearray(repository.store_load(index_name))
         corrupted[0] ^= 0xFF
         repository.store_store(index_name, bytes(corrupted))  # same name, rotted content
         assert repository.check(repair=False) is False  # mismatch between content hash and name detected
@@ -1409,12 +1805,12 @@ def test_check_reports_invalid_pack_name(tmp_path, caplog):
             assert repository.check(repair=False) is False
 
         assert "packs/not-a-hex-name has an invalid name" in caplog.text
-        after = PackTracker.load(repository.store)
+        after = PackTracker.load(repository)
         assert after.table[intact_id].result == 1  # the valid pack was checked
 
 
-def test_check_repair_rebuilds_corrupt_index(tmp_path):
-    # check(repair=True) rebuilds a corrupt index from the packs' object headers.
+def test_check_repair_rebuilds_corrupt_index(tmp_path, caplog):
+    # check(repair=True, repo_only=True) rebuilds a corrupt index from the packs' object headers.
     location = os.fspath(tmp_path / "repo")
     ids = [H(x) for x in range(10)]
     with Repository(location, exclusive=True, create=True) as repository:
@@ -1430,17 +1826,59 @@ def test_check_repair_rebuilds_corrupt_index(tmp_path):
             repository.store_store(name, bytes(data))
         assert repository.check(repair=False) is False  # read-only check reports the corrupt index
     with reopen(repository) as repository:
-        assert repository.check(repair=True, validate=validate_any) is True  # repair rebuilds the index from the packs
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="borg.repository"):
+            # repair rebuilds the index
+            assert repository.check(repair=True, repo_only=True, validate=validate_any) is True
+        # each rotted fragment is counted once (the cross-check does not load the known corrupt index).
+        assert f"Checked {len(index_names)} index files ({len(index_names)} errors)" in caplog.text
     with reopen(repository) as repository:
         assert repository.check(repair=False) is True  # the rebuilt index passes a read-only check
         for i, cid in enumerate(ids):
             assert pdchunk(repository.get(cid)) == bytes([i]) * 20  # every chunk is indexed and resolves
 
 
-@pytest.mark.parametrize("repo_only", [True, False])
-def test_check_repair_rebuild_validates_objects(tmp_path, caplog, repo_only):
-    # check(repair=True, validate=...) does not index an object validate rejects and reports it, refs
-    # #9901. That fails a repository-only run only.
+def test_check_full_repair_leaves_corrupt_index_to_archives_phase(tmp_path, caplog, monkeypatch):
+    # check(repair=True, repo_only=False) with a corrupt index verifies every pack, walks no pack objects,
+    # stores no index and succeeds: the archives phase rebuilds the index, refs #10434.
+    location = os.fspath(tmp_path / "repo")
+    with Repository(location, exclusive=True, create=True) as repository:
+        for x in range(3):
+            repository.put(H(x), fchunk(b"DATA-%02d" % x, chunk_id=H(x)))
+            repository.flush()  # seal a separate pack per chunk
+    with reopen(repository) as repository:
+        for info in repository.store_list("index"):  # rot every fragment
+            name = f"index/{info.name}"
+            data = bytearray(repository.store_load(name))
+            data[0] ^= 0xFF
+            repository.store_store(name, bytes(data))
+    orig_iter_headers = PackReader.iter_headers
+    walked = []
+
+    def counting_iter_headers(self, **kwargs):
+        walked.append(self.pack_id)
+        return orig_iter_headers(self, **kwargs)
+
+    monkeypatch.setattr(PackReader, "iter_headers", counting_iter_headers)
+    with reopen(repository) as repository:
+        pack_ids = {hex_to_bin(info.name) for info in repository.store_list("packs")}
+        index_before = {info.name for info in repository.store_list("index")}
+        with caplog.at_level(logging.INFO, logger="borg.repository"):
+            assert repository.check(repair=True, repo_only=False, validate=validate_any) is True
+        assert "and 3 packs (0 errors)." in caplog.text  # every pack was verified
+        assert "Finished full repository check, index corrupt; the archives check rebuilds it" in caplog.text
+        assert "has been rebuilt" not in caplog.text
+        assert walked == []  # no pack object was walked
+        assert {info.name for info in repository.store_list("index")} == index_before  # nothing stored
+        tracker = PackTracker.load(repository)
+        assert {pack_id for pack_id in pack_ids if tracker.get(pack_id).result} == pack_ids  # recorded intact
+    with reopen(repository) as repository:
+        assert repository.check(repair=False) is False  # the index is still corrupt
+
+
+def test_check_repair_rebuild_validates_objects(tmp_path, caplog):
+    # check(repair=True, repo_only=True, validate=...) does not index an object validate rejects, reports it
+    # and fails, refs #9901.
     location = os.fspath(tmp_path / "repo")
     ids = [H(x) for x in range(10)]
     rejected_id = ids[4]
@@ -1462,7 +1900,7 @@ def test_check_repair_rebuild_validates_objects(tmp_path, caplog, repo_only):
 
     caplog.set_level(logging.INFO)
     with reopen(repository) as repository:
-        assert repository.check(repair=True, repo_only=repo_only, validate=validate) is not repo_only
+        assert repository.check(repair=True, repo_only=True, validate=validate) is False
     assert set(ids) <= set(validated)
     assert "skipped 1 pack byte range(s) it could not authenticate" in caplog.text
     with reopen(repository) as repository:
@@ -1473,8 +1911,8 @@ def test_check_repair_rebuild_validates_objects(tmp_path, caplog, repo_only):
 
 
 def test_check_repair_refuses_when_pack_corrupt(tmp_path):
-    # A repair that finds any corrupt pack leaves the index and the pack untouched (no lossy rebuild,
-    # nothing dropped) and fails on a repository-only run, refs #8572, #10026.
+    # a repair without authenticate leaves a corrupt pack and the index unchanged and fails on a
+    # repository-only run.
     location = os.fspath(tmp_path / "repo")
     with Repository(location, exclusive=True, create=True) as repository:
         repository.put(H(1), fchunk(b"GOOD-CHUNK", chunk_id=H(1)))
@@ -1492,7 +1930,7 @@ def test_check_repair_refuses_when_pack_corrupt(tmp_path):
             idata[0] ^= 0xFF
             repository.store_store(name, bytes(idata))
     with reopen(repository) as repository:
-        # a repository-only repair cannot fix a corrupt pack, so it fails.
+        # a repository-only repair that can not salvage a corrupt pack fails.
         assert repository.check(repair=True, repo_only=True, validate=validate_any) is False
         # the corrupt pack is left in place, not dropped.
         assert bad_pack_name in [f"packs/{info.name}" for info in repository.store_list("packs")]
@@ -1500,9 +1938,42 @@ def test_check_repair_refuses_when_pack_corrupt(tmp_path):
         assert repository.check(repair=False) is False  # index was not rebuilt; still corrupt
 
 
-def test_check_repair_leaves_index_when_interrupted(tmp_path, caplog, monkeypatch):
+def test_check_full_repair_defers_corrupt_index_with_corrupt_pack(tmp_path, caplog):
+    # check(repair=True, repo_only=False) with a corrupt index and a corrupt pack succeeds and stores no
+    # index: the archives phase rebuilds the index and repairs what the corrupt pack held, refs #10434.
+    location = os.fspath(tmp_path / "repo")
+    with Repository(location, exclusive=True, create=True) as repository:
+        repository.put(H(1), fchunk(b"GOOD-CHUNK", chunk_id=H(1)))
+        repository.flush()  # seal a pack holding H(1)
+        repository.put(H(2), fchunk(b"LOST-CHUNK", chunk_id=H(2)))
+        repository.flush()  # seal a separate pack holding H(2)
+    with reopen(repository) as repository:
+        bad_pack_id = repository.chunks[H(2)].pack_id
+        bad_pack_name = "packs/" + bin_to_hex(bad_pack_id)
+        data = bytearray(repository.store_load(bad_pack_name))
+        data[-1] ^= 0xFF  # rot the pack holding H(2): its content no longer matches its store hash name
+        repository.store_store(bad_pack_name, bytes(data))
+        for info in repository.store_list("index"):  # rot every fragment
+            name = f"index/{info.name}"
+            idata = bytearray(repository.store_load(name))
+            idata[0] ^= 0xFF
+            repository.store_store(name, bytes(idata))
+    with reopen(repository) as repository:
+        index_before = {info.name for info in repository.store_list("index")}
+        with caplog.at_level(logging.INFO, logger="borg.repository"):
+            assert repository.check(repair=True, repo_only=False, validate=validate_any) is True
+        assert "and 2 packs (1 errors)." in caplog.text
+        assert "corrupt pack(s) left; index corrupt, the archives check rebuilds it from the packs." in caplog.text
+        assert {info.name for info in repository.store_list("index")} == index_before  # nothing stored
+        assert bad_pack_name in [f"packs/{info.name}" for info in repository.store_list("packs")]  # not dropped
+        assert PackTracker.load(repository).corrupt_ids() == [bad_pack_id]  # recorded corrupt
+
+
+@pytest.mark.parametrize("repo_only", [True, False])
+def test_check_repair_leaves_index_when_interrupted(tmp_path, caplog, monkeypatch, repo_only):
     # an interrupted repair (SIGINT before every pack is verified) must not rebuild the index from
-    # packs it did not confirm intact: it leaves the corrupt index in place and fails.
+    # packs it did not confirm intact: it leaves the corrupt index in place and fails. A full check fails, too:
+    # an interrupted check skips the archives phase.
     location = os.fspath(tmp_path / "repo")
     ids = [H(x) for x in range(10)]
     with Repository(location, exclusive=True, create=True) as repository:
@@ -1519,33 +1990,176 @@ def test_check_repair_leaves_index_when_interrupted(tmp_path, caplog, monkeypatc
         monkeypatch.setattr("borg.repository.sig_int", True)  # simulate a SIGINT before the pack loop
         with caplog.at_level(logging.ERROR, logger="borg.repository"):
             # interrupted: index not rebuilt, so it fails
-            assert repository.check(repair=True, validate=validate_any) is False
+            assert repository.check(repair=True, repo_only=repo_only, validate=validate_any) is False
         assert "index still corrupt" in caplog.text
     with reopen(repository) as repository:
         assert repository.check(repair=False) is False  # repair left the index corrupt
 
 
-def test_check_repair_reports_missing_pack_as_error(tmp_path, caplog):
-    # a repair with an intact index but a pack the index references missing from packs/ reports the
-    # loss and fails a repository-only run; a full check defers it to the archives phase (refs #9898,
-    # #8572).
+def reject_any(chunk_id, obj):
+    # A validator that rejects every object, so the index rebuild skips (drops) every object it reads.
+    return False
+
+
+@pytest.mark.parametrize("validate", [validate_any, reject_any], ids=["accept", "reject"])
+def test_check_repair_index_rebuild_interrupted(tmp_path, caplog, monkeypatch, validate):
+    # a Ctrl-C after the packs were verified, while the repair rebuilds the index from them: the rebuild
+    # stops, the corrupt fragments stay, and the check reports the index as corrupt, also when the
+    # rebuild skipped objects before the Ctrl-C.
+    from .. import cache as cache_module
+
     location = os.fspath(tmp_path / "repo")
     with Repository(location, exclusive=True, create=True) as repository:
-        for x in range(3):
+        for i in range(4):
+            repository.put(H(i), fchunk(bytes([i]) * 20, chunk_id=H(i)))
+            repository.flush()  # seal after every put, so each chunk gets its own pack
+    with reopen(repository) as repository:
+        for info in repository.store_list("index"):  # rot every fragment so repair takes the rebuild path
+            name = f"index/{info.name}"
+            data = bytearray(repository.store_load(name))
+            data[0] ^= 0xFF
+            repository.store_store(name, bytes(data))
+
+    interrupter = Interrupter()
+    orig_iter_headers = PackReader.iter_headers
+    packs_read = []
+
+    def iter_headers_then_interrupt(self, **kwargs):
+        packs_read.append(self.pack_id)
+        yield from orig_iter_headers(self, **kwargs)
+        interrupter.triggered = True  # one Ctrl-C after the rebuild walked the first pack
+
+    # check() and the rebuild each read sig_int through their own module namespace.
+    monkeypatch.setattr(repository_module, "sig_int", interrupter)
+    monkeypatch.setattr(cache_module, "sig_int", interrupter)
+    monkeypatch.setattr(PackReader, "iter_headers", iter_headers_then_interrupt)
+    with reopen(repository) as repository:
+        assert len(repository.store_list("packs")) > 1  # there is a pack boundary to stop at
+        index_before = set(info.name for info in repository.store_list("index"))
+        with caplog.at_level(logging.WARNING, logger="borg.repository"):
+            assert repository.check(repair=True, repo_only=True, validate=validate) is False
+        assert "Index rebuild interrupted" in caplog.text
+        assert "Interrupted full repository check, index still corrupt so far." in caplog.text
+        assert "index rebuilt" not in caplog.text
+        assert len(packs_read) == 1  # the rebuild stopped at the pack boundary
+        assert set(info.name for info in repository.store_list("index")) == index_before  # nothing stored
+    monkeypatch.setattr(PackReader, "iter_headers", orig_iter_headers)
+    interrupter.triggered = False  # the next check runs without a pending Ctrl-C
+    with reopen(repository) as repository:
+        assert repository.check(repair=False) is False  # the interrupted repair left the index corrupt
+
+
+def create_repo_one_pack_per_chunk(location, count=3):
+    # H(0) .. H(count - 1), each in its own pack; the index is persisted at close.
+    with Repository(location, exclusive=True, create=True) as repository:
+        for x in range(count):
             repository.put(H(x), fchunk(b"DATA-%02d" % x, chunk_id=H(x)))
-        repository.flush()  # flush before close persists the index
-    with reopen(repository) as repository:
-        pack_id = repository.chunks[H(0)].pack_id
-        repository.store_delete("packs/" + bin_to_hex(pack_id))  # pack gone, index entry kept
-    with reopen(repository) as repository:
-        # a repository-only repair cannot recover the lost chunks, so it fails and reports the error.
+            repository.flush()  # seal a separate pack per chunk
+        return {x: repository.chunks[H(x)].pack_id for x in range(count)}
+
+
+def delete_pack(repository, pack_id):
+    repository.store_delete("packs/" + bin_to_hex(pack_id))  # pack gone, index entries kept
+
+
+@pytest.mark.parametrize("repo_only", [True, False])
+def test_check_repair_removes_missing_pack_entries(tmp_path, caplog, repo_only):
+    # a repair removes the index entries of the chunks in a missing pack and stores the index. It fails
+    # a repository-only run, as the chunks are lost; a full check defers them to the archives phase
+    # (refs #9898).
+    location = os.fspath(tmp_path / "repo")
+    pack_ids = create_repo_one_pack_per_chunk(location)
+    with Repository(location, exclusive=True) as repository:
+        delete_pack(repository, pack_ids[0])
+    with Repository(location, exclusive=True) as repository:
+        with caplog.at_level(logging.WARNING, logger="borg.repository"):
+            assert repository.check(repair=True, repo_only=repo_only, validate=validate_any) is not repo_only
+        assert f"Missing pack: {bin_to_hex(pack_ids[0])}" in caplog.text
+        assert "Removed the index entries of their 1 chunk(s)." in caplog.text
+        assert "missing pack(s) found" in caplog.text
+    with Repository(location, exclusive=True) as repository:
+        assert H(0) not in repository.chunks  # the stored index lacks the entry of the missing pack
+        assert H(1) in repository.chunks and H(2) in repository.chunks
+        caplog.clear()
+        assert repository.check(repair=False) is True
+        assert "Missing pack" not in caplog.text
+
+
+def test_check_without_repair_does_not_store_the_index(tmp_path, caplog):
+    # a check without repair removes the entries of a missing pack from repository.chunks, but does not
+    # store the index.
+    location = os.fspath(tmp_path / "repo")
+    pack_ids = create_repo_one_pack_per_chunk(location)
+    with Repository(location, exclusive=True) as repository:
+        delete_pack(repository, pack_ids[0])
+    with Repository(location, exclusive=True) as repository:
+        index_before = {info.name for info in repository.store_list("index")}
         with caplog.at_level(logging.ERROR, logger="borg.repository"):
-            assert repository.check(repair=True, repo_only=True, validate=validate_any) is False
-        assert f"Missing pack: {bin_to_hex(pack_id)}" in caplog.text
-        assert "errors found" in caplog.text
-    with reopen(repository) as repository:
-        # a full check defers the missing pack to the archives phase, so the repository phase passes.
-        assert repository.check(repair=True, repo_only=False, validate=validate_any) is True
+            assert repository.check(repair=False) is False
+        assert 'Run "borg check --repair" to remove their entries from the repository index.' in caplog.text
+        assert H(0) not in repository.chunks
+        assert repository.get(H(0), raise_missing=False) is None
+        assert H(1) in repository.chunks
+    with Repository(location, exclusive=True) as repository:
+        assert {info.name for info in repository.store_list("index")} == index_before
+        assert H(0) in repository.chunks  # the stored index is unchanged
+        assert repository.check(repair=False) is False  # still reported
+
+
+def test_check_repair_all_packs_missing_stores_empty_index(tmp_path):
+    # if no entry is left, the repair stores an empty index and deletes the old fragments.
+    location = os.fspath(tmp_path / "repo")
+    pack_ids = create_repo_one_pack_per_chunk(location)
+    with Repository(location, exclusive=True) as repository:
+        for pack_id in pack_ids.values():
+            delete_pack(repository, pack_id)
+        index_before = {info.name for info in repository.store_list("index")}
+    with Repository(location, exclusive=True) as repository:
+        assert repository.check(repair=True, repo_only=True, validate=validate_any) is False
+        index_after = {info.name for info in repository.store_list("index")}
+        assert len(index_after) == 1 and not index_after & index_before
+    with Repository(location, exclusive=True) as repository:
+        assert len(repository.chunks) == 0
+        assert repository.check(repair=False) is True
+
+
+def test_check_repair_removes_missing_pack_entries_with_a_corrupt_pack(tmp_path):
+    # a repair without authenticate keeps a corrupt pack and its entries, and removes the entries of a
+    # missing pack.
+    location = os.fspath(tmp_path / "repo")
+    pack_ids = create_repo_one_pack_per_chunk(location)
+    with Repository(location, exclusive=True) as repository:
+        delete_pack(repository, pack_ids[0])
+        bad_pack_name = "packs/" + bin_to_hex(pack_ids[1])
+        data = bytearray(repository.store_load(bad_pack_name))
+        data[-1] ^= 0xFF  # its content no longer matches its store hash name
+        repository.store_store(bad_pack_name, bytes(data))
+    with Repository(location, exclusive=True) as repository:
+        assert repository.check(repair=True, repo_only=True, validate=validate_any) is False
+    with Repository(location, exclusive=True) as repository:
+        assert H(0) not in repository.chunks
+        assert H(1) in repository.chunks and H(2) in repository.chunks
+        assert bad_pack_name in [f"packs/{info.name}" for info in repository.store_list("packs")]
+
+
+def test_check_confirms_missing_pack_before_removing_entries(tmp_path, caplog, monkeypatch):
+    # a pack that the packs/ listing lacks, but that store.info() finds, is not missing: its entries
+    # are kept.
+    location = os.fspath(tmp_path / "repo")
+    pack_ids = create_repo_one_pack_per_chunk(location)
+    unlisted = bin_to_hex(pack_ids[0])
+    with Repository(location, exclusive=True) as repository:
+        store_list = repository.store.list
+
+        def list_without_pack(name, **kw):
+            return (info for info in store_list(name, **kw) if not (name == "packs" and info.name == unlisted))
+
+        monkeypatch.setattr(repository.store, "list", list_without_pack)
+        with caplog.at_level(logging.ERROR, logger="borg.repository"):
+            assert repository.check(repair=True, repo_only=True, validate=validate_any) is True
+        assert "Missing pack" not in caplog.text
+    with Repository(location, exclusive=True) as repository:
+        assert H(0) in repository.chunks
 
 
 def test_check_warns_on_invalid_chunk_index(tmp_path, caplog):
@@ -1621,9 +2235,10 @@ def test_check_reports_orphan_pack_not_referenced_by_index(tmp_path, caplog):
 
 
 def test_check_missing_pack_detection_skipped_when_index_unreadable(tmp_path, caplog):
-    # an index/ fragment whose name matches its content hash but whose content does not deserialize
-    # into a ChunkIndex makes the fragment set unreadable; check skips the cross-check (and still
-    # passes) instead of crashing or rebuilding from the packs (refs #9898).
+    # an index/ fragment whose name matches its content hash and whose envelope is authentic, but whose
+    # content does not deserialize into a ChunkIndex, makes the fragment set unreadable; check reports it
+    # as an index error and skips the cross-check instead of crashing or rebuilding from the packs
+    # (refs #9898).
     location = os.fspath(tmp_path / "repo")
     with Repository(location, exclusive=True, create=True) as repository:
         for x in range(3):
@@ -1632,12 +2247,41 @@ def test_check_missing_pack_detection_skipped_when_index_unreadable(tmp_path, ca
     with Repository(location, exclusive=True) as repository:
         pack_id = repository.chunks[H(0)].pack_id
         repository.store_delete("packs/" + bin_to_hex(pack_id))  # pack gone, index entry kept
-        content = b"not a serialized chunk index"
-        repository.store_store("index/" + store_hash(content).hexdigest(), content)
+        index_name = repository.store_encrypt_store("index", b"not a serialized chunk index", hashed_name=True)
         with caplog.at_level(logging.WARNING):
-            assert repository.check(repair=False) is True
+            assert repository.check(repair=False) is False
         assert "Missing pack" not in caplog.text
         assert "Cannot cross-check packs against the chunk index" in caplog.text
+        assert f"Store object {index_name} is corrupted" in caplog.text
+
+
+@pytest.mark.parametrize("tamper", ["plaintext", "other_key"])
+def test_check_repairs_index_fragment_failing_authentication(tmp_path, caplog, tamper):
+    # a fragment that matches its name, but fails the authentication (e.g. written by a hostile store
+    # without the key, or by an older borg 2 beta as plaintext) is an index error, and repair rebuilds
+    # the index from the packs, dropping that fragment.
+    location = os.fspath(tmp_path / "repo")
+    with Repository(location, exclusive=True, create=True) as repository:
+        for x in range(3):
+            repository.put(H(x), fchunk(b"DATA-%02d" % x, chunk_id=H(x)))
+        repository.flush()
+    with Repository(location, exclusive=True) as repository:
+        with io.BytesIO() as f:
+            ChunkIndex().write(f)
+            content = f.getvalue()
+        if tamper == "plaintext":
+            data = content
+        else:
+            data = make_store_obj_key(AESOCBKey, repository).encrypt(b"", content, aad=b"")
+        name = store_hash(data).hexdigest()
+        repository.store_store(f"index/{name}", data)
+        with caplog.at_level(logging.ERROR):
+            assert repository.check(repair=False) is False
+        assert f"Store object index/{name} is corrupted" in caplog.text
+        assert name in {info.name for info in repository.store_list("index")}  # a check does not write.
+        assert repository.check(repair=True, repo_only=True, validate=accept_all) is True
+        assert name not in {info.name for info in repository.store_list("index")}
+        assert repository.check(repair=False) is True
 
 
 def test_check_partial_still_detects_missing_pack(tmp_path, caplog):
@@ -1659,21 +2303,37 @@ def test_check_partial_still_detects_missing_pack(tmp_path, caplog):
 def test_check_checked_packs_roundtrip(tmp_path):
     # the set survives a store/load round-trip; a rotted blob loads as empty.
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.table[H(1)] = PackTracker.Entry(timestamp=123, result=1)
         tracker.table[H(2)] = PackTracker.Entry(timestamp=456, result=0)
         tracker.save()
 
-        loaded = PackTracker.load(repository.store)
+        loaded = PackTracker.load(repository)
         assert len(loaded) == 2
         assert H(1) in loaded.table and H(2) in loaded.table
         assert tuple(loaded.table[H(2)]) == (456, 0)
 
         corrupted = bytearray(repository.store.load(PackTracker.NAME))
-        corrupted[0] ^= 0xFF  # break the appended store hash
+        corrupted[-1] ^= 0xFF  # fails the authentication of the key's envelope
         repository.store.store(PackTracker.NAME, bytes(corrupted))
-        rotted = PackTracker.load(repository.store)
+        rotted = PackTracker.load(repository)
         assert len(rotted) == 0
+
+
+def test_check_checked_packs_bound_to_its_name(tmp_path, caplog):
+    # an object in the key's envelope, copied from another name to cache/checked-packs, is ignored:
+    # the envelope binds the object to its name.
+    with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
+        tracker = PackTracker.new(repository)
+        tracker.table[H(1)] = PackTracker.Entry(timestamp=123, result=1)
+        with io.BytesIO() as f:
+            tracker.table.write(f)
+            data = f.getvalue()
+        repository.store_encrypt_store("cache/other", data)
+        repository.store_store(PackTracker.NAME, repository.store_load("cache/other"))
+        with caplog.at_level(logging.WARNING):
+            assert len(PackTracker.load(repository)) == 0
+        assert "Ignoring corrupted checked-packs set." in caplog.text
 
 
 def test_check_partial_rechecks_pack_sorting_before_checked_one(tmp_path):
@@ -1684,7 +2344,7 @@ def test_check_partial_rechecks_pack_sorting_before_checked_one(tmp_path):
         repository.store_store("packs/" + bin_to_hex(intact_id), intact)
 
         # mark the intact pack as recently checked.
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(intact_id, ok=True)
         tracker.save()
 
@@ -1702,7 +2362,7 @@ def test_check_partial_rechecks_pack_recorded_corrupt(tmp_path):
         corrupt_id = H(1)  # stored content does not hash to this name
         repository.store_store("packs/" + bin_to_hex(corrupt_id), b"CORRUPT-does-not-match-name")
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(corrupt_id, ok=False)
         tracker.save()
 
@@ -1736,7 +2396,7 @@ def test_check_partial_clears_recorded_corruption_when_intact(tmp_path, monkeypa
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, pack_key = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(intact_id, ok=False)  # stale corrupt record
         tracker.save()
 
@@ -1751,7 +2411,7 @@ def test_check_partial_skips_pack_recorded_intact(tmp_path, monkeypatch):
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, pack_key = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(intact_id, ok=True)
         tracker.save()
 
@@ -1766,7 +2426,7 @@ def test_check_without_max_age_verifies_all_but_keeps_records(tmp_path, monkeypa
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, pack_key = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(intact_id, ok=True)
         tracker.save()
 
@@ -1775,7 +2435,7 @@ def test_check_without_max_age_verifies_all_but_keeps_records(tmp_path, monkeypa
         assert repository.check(repair=False) is True
         assert pack_key in hashed_keys  # verified despite the fresh intact record
 
-        after = PackTracker.load(repository.store)
+        after = PackTracker.load(repository)
         assert after.table[intact_id].result == 1  # record kept
 
 
@@ -1793,7 +2453,7 @@ def test_check_full_keeps_records_after_check(tmp_path):
 
         assert repository.check(repair=False) is False
 
-        after = PackTracker.load(repository.store)
+        after = PackTracker.load(repository)
         assert after.corrupt_ids() == [corrupt_id]
         assert after.table[intact_id].result == 1
 
@@ -1814,7 +2474,7 @@ def test_check_full_reverifies_carried_over_corrupt_record(tmp_path, monkeypatch
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, pack_key = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(intact_id, ok=False)  # recorded corrupt in an earlier check
         tracker.save()
 
@@ -1823,7 +2483,7 @@ def test_check_full_reverifies_carried_over_corrupt_record(tmp_path, monkeypatch
         assert repository.check(repair=False) is True
         assert pack_key in hashed_keys  # re-verified
 
-        after = PackTracker.load(repository.store)
+        after = PackTracker.load(repository)
         assert after.table[intact_id].result == 1  # verified intact, corrupt record replaced
 
 
@@ -1832,13 +2492,13 @@ def test_check_full_prunes_corrupt_record_of_vanished_pack(tmp_path):
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, _ = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(H(9), ok=False)  # no such pack in packs/
         tracker.save()
 
         assert repository.check(repair=False) is True
 
-        after = PackTracker.load(repository.store)
+        after = PackTracker.load(repository)
         assert H(9) not in after.table
         assert intact_id in after.table
 
@@ -1849,11 +2509,11 @@ def test_check_partial_keeps_corrupt_record_across_runs(tmp_path):
         corrupt_id = _store_corrupt_pack(repository, H(1))
 
         assert repository.check(repair=False, max_duration=3600, max_age=3600) is False
-        assert PackTracker.load(repository.store).corrupt_ids() == [corrupt_id]
+        assert PackTracker.load(repository).corrupt_ids() == [corrupt_id]
 
         # a second run re-verifies it and keeps reporting it.
         assert repository.check(repair=False, max_duration=3600, max_age=3600) is False
-        assert PackTracker.load(repository.store).corrupt_ids() == [corrupt_id]
+        assert PackTracker.load(repository).corrupt_ids() == [corrupt_id]
 
 
 def test_check_partial_break_reports_unreached_corrupt_record(tmp_path, monkeypatch, caplog):
@@ -1867,7 +2527,7 @@ def test_check_partial_break_reports_unreached_corrupt_record(tmp_path, monkeypa
         corrupt_key = "packs/" + bin_to_hex(corrupt_id)
         repository.store_store(corrupt_key, b"CORRUPT-does-not-match-name")
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(corrupt_id, ok=False)  # recorded corrupt by an earlier check
         tracker.save()
 
@@ -1898,7 +2558,7 @@ def test_check_max_age_skips_fresh_ok(tmp_path, monkeypatch):
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, pack_key = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(intact_id, ok=True)  # fresh timestamp
         tracker.save()
 
@@ -1907,7 +2567,7 @@ def test_check_max_age_skips_fresh_ok(tmp_path, monkeypatch):
         assert repository.check(repair=False, max_age=3600) is True
         assert pack_key not in hashed_keys  # skipped, its record is fresh
 
-        after = PackTracker.load(repository.store)
+        after = PackTracker.load(repository)
         assert after.table[intact_id].result == 1  # record kept
 
 
@@ -1917,7 +2577,7 @@ def test_check_max_age_reverifies_stale_ok(tmp_path, monkeypatch):
         intact_id, pack_key = _store_intact_pack(repository)
 
         max_age = 50
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         old_ts = int(time.time()) - (max_age + 100)  # clearly beyond max_age
         tracker.table[intact_id] = PackTracker.Entry(timestamp=old_ts, result=1)
         tracker.save()
@@ -1927,7 +2587,7 @@ def test_check_max_age_reverifies_stale_ok(tmp_path, monkeypatch):
         assert repository.check(repair=False, max_age=max_age) is True
         assert pack_key in hashed_keys  # stale, re-verified
 
-        after = PackTracker.load(repository.store)
+        after = PackTracker.load(repository)
         assert after.table[intact_id].timestamp > old_ts  # record refreshed
 
 
@@ -1937,7 +2597,7 @@ def test_check_max_age_reverifies_stale_within_skew(tmp_path, monkeypatch):
         intact_id, pack_key = _store_intact_pack(repository)
 
         max_age = MAX_CLOCK_SKEW * 2  # window wider than MAX_CLOCK_SKEW
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         past_ts = int(time.time()) - (max_age + MAX_CLOCK_SKEW // 2)  # just past the window
         tracker.table[intact_id] = PackTracker.Entry(timestamp=past_ts, result=1)
         tracker.save()
@@ -1953,7 +2613,7 @@ def test_check_max_age_skips_near_future_ok(tmp_path, monkeypatch):
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, pack_key = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         future_ts = int(time.time()) + MAX_CLOCK_SKEW // 2
         tracker.table[intact_id] = PackTracker.Entry(timestamp=future_ts, result=1)
         tracker.save()
@@ -1969,7 +2629,7 @@ def test_check_max_age_reverifies_far_future_ok(tmp_path, monkeypatch):
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, pack_key = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         far_future_ts = int(time.time()) + MAX_CLOCK_SKEW + 3600
         tracker.table[intact_id] = PackTracker.Entry(timestamp=far_future_ts, result=1)
         tracker.save()
@@ -1987,7 +2647,7 @@ def test_check_max_age_reverifies_future_beyond_small_window(tmp_path, monkeypat
         intact_id, pack_key = _store_intact_pack(repository)
 
         small_window = MAX_CLOCK_SKEW // 4
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         future_ts = int(time.time()) + MAX_CLOCK_SKEW // 2  # ahead of us, but < MAX_CLOCK_SKEW
         tracker.table[intact_id] = PackTracker.Entry(timestamp=future_ts, result=1)
         tracker.save()
@@ -2003,7 +2663,7 @@ def test_check_max_age_reverifies_corrupt_even_when_fresh(tmp_path, monkeypatch)
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, pack_key = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(intact_id, ok=False)  # fresh, but corrupt
         tracker.save()
 
@@ -2018,14 +2678,14 @@ def test_check_max_age_prunes_vanished_ok_record(tmp_path):
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         intact_id, _ = _store_intact_pack(repository)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(intact_id, ok=True)
         tracker.record(H(9), ok=True)  # no such pack in packs/
         tracker.save()
 
         assert repository.check(repair=False, max_age=3600) is True
 
-        after = PackTracker.load(repository.store)
+        after = PackTracker.load(repository)
         assert intact_id in after.table
         assert H(9) not in after.table
 
@@ -2040,7 +2700,7 @@ def test_check_max_age_partial_progress(tmp_path, monkeypatch):
         repository.store_store("packs/" + bin_to_hex(pack_a_id), pack_a)
         repository.store_store("packs/" + bin_to_hex(pack_b_id), pack_b)
 
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.record(pack_a_id, ok=True)  # fresh
         tracker.save()
 
@@ -2050,7 +2710,7 @@ def test_check_max_age_partial_progress(tmp_path, monkeypatch):
         assert "packs/" + bin_to_hex(pack_a_id) not in hashed_keys
         assert "packs/" + bin_to_hex(pack_b_id) in hashed_keys
 
-        after = PackTracker.load(repository.store)
+        after = PackTracker.load(repository)
         assert pack_a_id in after.table and pack_b_id in after.table
 
 
@@ -2069,7 +2729,7 @@ def test_check_partial_orders_stale_oldest_first_and_skips_fresh(tmp_path, monke
         newer_key = "packs/" + bin_to_hex(newer_id)
 
         now = int(time.time())
-        tracker = PackTracker.new(repository.store)
+        tracker = PackTracker.new(repository)
         tracker.table[fresh_id] = PackTracker.Entry(timestamp=now - 10, result=1)  # within max_age
         tracker.table[older_id] = PackTracker.Entry(timestamp=now - (max_age + 1000), result=1)
         tracker.table[newer_id] = PackTracker.Entry(timestamp=now - (max_age + 100), result=1)
@@ -2098,7 +2758,7 @@ def test_check_max_age_reuses_records_of_plain_check(tmp_path, monkeypatch):
 
 
 def test_check_checked_packs_ignores_foreign_entry_layout(tmp_path):
-    # load() drops a set whose entries have a different layout than Entry, even though its store hash matches.
+    # load() drops a set whose entries have a different layout than Entry, even though its envelope is authentic.
     OtherEntry = namedtuple("OtherEntry", "timestamp result extra")
     OtherFormat = namedtuple("OtherFormat", "timestamp result extra")
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
@@ -2109,9 +2769,9 @@ def test_check_checked_packs_ignores_foreign_entry_layout(tmp_path):
         with io.BytesIO() as f:
             table.write(f)
             data = f.getvalue()
-        repository.store_store(PackTracker.NAME, data + store_hash(data).digest())
+        repository.store_encrypt_store(PackTracker.NAME, data)
 
-        tracker = PackTracker.load(repository.store)
+        tracker = PackTracker.load(repository)
         assert len(tracker) == 0
 
 
@@ -2136,12 +2796,10 @@ def test_check_progress_covers_packs_and_index(tmp_path, monkeypatch):
     monkeypatch.setattr("borg.repository.ProgressIndicatorPercent", FakePI)
     pack = fchunk(b"A", chunk_id=H(1))
     pack_name = "packs/" + store_hash(pack).hexdigest()
-    index_content = _serialized_chunkindex()
-    index_name = "index/" + store_hash(index_content).hexdigest()
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         repository.store_store(pack_name, pack)
-        repository.store_store(index_name, index_content)
-        # create() already wrote a chunk index, so don't assume a count: derive it from the store.
+        repository.store_encrypt_store("index", _serialized_chunkindex(), hashed_name=True)
+        # don't assume a count: derive it from the store.
         n_packs = len(repository.store_list("packs"))
         n_index = len(repository.store_list("index"))
         assert repository.check(repair=False) is True
@@ -2194,6 +2852,18 @@ def test_pack_reader_iter_headers_reads_through_store(tmp_path):
     with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
         repository.store_store("packs/" + bin_to_hex(pack_id), pack)
         reader = PackReader(repository.store, pack_id)
+        assert list(reader.iter_headers()) == [(H(47), 0, len(obj1)), (H(48), len(obj1), len(obj2))]
+
+
+def test_pack_reader_with_pack_size_does_not_look_up_the_size(tmp_path, monkeypatch):
+    obj1 = fchunk(b"FIRST", chunk_id=H(47))
+    obj2 = fchunk(b"SECOND", chunk_id=H(48))
+    pack = obj1 + obj2
+    pack_id = H(43)
+    with Repository(str(tmp_path / "repo"), exclusive=True, create=True) as repository:
+        repository.store_store("packs/" + bin_to_hex(pack_id), pack)
+        reader = PackReader(repository.store, pack_id, pack_size=len(pack))
+        monkeypatch.setattr(repository.store, "info", None)  # a size lookup would raise TypeError
         assert list(reader.iter_headers()) == [(H(47), 0, len(obj1)), (H(48), len(obj1), len(obj2))]
 
 
@@ -2612,6 +3282,18 @@ def test_superseded_gap_ranges_reports_an_authenticated_duplicate(tmp_path):
     assert gap_ranges(obj, chunks, None) == []  # no validator, nothing to report
 
 
+def test_superseded_gap_ranges_keeps_a_duplicate_indexed_in_an_untrusted_pack(tmp_path):
+    repo_objs = aead_repo_objs(tmp_path)
+    (obj,), chunks = gap_pack(repo_objs, [b"superseded"])
+    reader = PackReader(pack_contents=obj)
+    validate = object_validator(repo_objs)
+
+    ranges = superseded_gap_ranges(
+        reader, chunks, THIS_PACK, [], len(obj), validate=validate, untrusted_pack_ids={OTHER_PACK}
+    )
+    assert ranges == []
+
+
 def test_superseded_gap_ranges_rejects_a_forged_chunk_id(tmp_path):
     # the header's chunk id is replaced by the id of another indexed chunk, which the metadata
     # slot's tag does not authenticate.
@@ -2675,12 +3357,18 @@ def test_superseded_gap_ranges_warns_where_it_keeps_bytes(tmp_path, caplog):
         assert gap_ranges(bytes(damaged) + garbage, chunks, validate) == []
         assert gap_ranges(b"\0" * 3, chunks, validate) == []
 
-    assert f"pack {pack_hex}: object does not authenticate at offset 0 in a gap, keeping its bytes." in caplog.text
+    assert (
+        f"pack {pack_hex}: object header or metadata does not authenticate at offset 0 in a gap, keeping its bytes."
+        in caplog.text
+    )
     assert (
         f"pack {pack_hex}: no object header at offset {len(rejected)} in a gap, "
         f"keeping the remaining {len(garbage)} bytes of the gap." in caplog.text
     )
-    assert f"pack {pack_hex}: 3 bytes, too few for an object header, at offset 0 in a gap" in caplog.text
+    assert (
+        f"pack {pack_hex}: object too small: expected at least {RepoObj.obj_header.size} header bytes, got 3 bytes "
+        f"at offset 0 in a gap" in caplog.text
+    )
 
 
 def test_superseded_gap_ranges_ends_at_an_object_reaching_past_the_gap(tmp_path, caplog):
@@ -2824,20 +3512,802 @@ def test_open_refuses_bad_config(tmp_path):
 
 
 def test_create_failure_leaves_no_store_behind(tmp_path, monkeypatch):
-    # a failure inside create() after the store was created (e.g. disk full while writing the empty chunk
-    # index) must not leave a store without config behind.
-    from .. import cache as cache_module
+    # a failure inside create() after the store was created (e.g. disk full while writing the config)
+    # must not leave a store without config behind.
 
-    def failing_write(*args, **kwargs):
+    def failing_save_config(self, key=None):
         raise OSError("simulated disk full")
 
-    monkeypatch.setattr(cache_module, "write_chunkindex_to_repo", failing_write)
     location = os.fspath(tmp_path / "repo")
-    with pytest.raises(OSError, match="simulated disk full"):
-        with Repository(location, exclusive=True, create=True):
-            pass
+    with monkeypatch.context() as m:
+        m.setattr(Repository, "save_config", failing_save_config)
+        with pytest.raises(OSError, match="simulated disk full"):
+            with Repository(location, exclusive=True, create=True):
+                pass
     assert not os.path.exists(location)
-    monkeypatch.undo()
     with Repository(location, exclusive=True, create=True):  # and creating it afterwards works
         pass
     assert os.path.exists(os.path.join(location, "config", "config"))
+
+
+def store_damaged_pack(repository, objs, *, listed, flip=(), tail=b"", size=100):
+    """Store objs as one pack named by the store hash of their bytes, then damage it.
+
+    The byte at each position in flip is flipped and tail is appended, so a flip or a tail makes the
+    pack fail its store hash. The objects at the indexes in listed get chunk index entries, with
+    plaintext size <size> (the tests' chunks hold 100 bytes).
+    Returns pack_id.
+    """
+    pack = b"".join(obj for _, obj in objs)
+    pack_id = store_hash(pack).digest()
+    offsets = []
+    offset = 0
+    for _, obj in objs:
+        offsets.append(offset)
+        offset += len(obj)
+    damaged = bytearray(pack)
+    for pos in flip:
+        damaged[pos] ^= 0xFF
+    repository.store_store("packs/" + bin_to_hex(pack_id), bytes(damaged) + tail)
+    for i in listed:
+        chunk_id, obj = objs[i]
+        repository.chunks[chunk_id] = ChunkIndexEntry(
+            flags=ChunkIndex.F_USED, size=size, pack_id=pack_id, obj_offset=offsets[i], obj_size=len(obj)
+        )
+    return pack_id
+
+
+def last_byte_offset(objs, i):
+    # position of the last byte of objs[i] in a pack of objs: the last byte of its data slot.
+    return sum(len(obj) for _, obj in objs[: i + 1]) - 1
+
+
+def salvage(repository, repo_objs, pack_id, **kwargs):
+    kwargs.setdefault("authenticate", whole_object_authenticator(repo_objs))
+    return repository.salvage_pack(pack_id, validate=object_validator(repo_objs), **kwargs)
+
+
+def store_contents(repository):
+    # {name: content} of every pack in the store.
+    return {info.name: repository.store_load("packs/" + info.name) for info in repository.store_list("packs")}
+
+
+def index_contents(chunks):
+    return dict(chunks.iteritems())
+
+
+@pytest.fixture()
+def salvage_repository(tmp_path):
+    with Repository(os.fspath(tmp_path / "repo"), exclusive=True, create=True) as repository:
+        repository.chunks = ChunkIndex()  # the tests add their entries to an empty chunk index
+        yield repository
+
+
+def three_objects(repo_objs):
+    return [real_chunk(repo_objs, bytes([i]) * 100) for i in range(3)]
+
+
+def test_salvage_pack_leaves_an_intact_pack_alone(salvage_repository):
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3))
+    packs_before, index_before = store_contents(salvage_repository), index_contents(salvage_repository.chunks)
+    called = []
+
+    result = salvage(salvage_repository, repo_objs, pack_id, before_old_pack_delete=lambda: called.append(1))
+
+    assert result.status == SALVAGE_INTACT
+    assert (result.new_pack_id, result.kept, result.dropped_bytes, result.removed_ids) == (None, [], 0, [])
+    assert store_contents(salvage_repository) == packs_before
+    assert index_contents(salvage_repository.chunks) == index_before
+    assert not called
+
+
+def test_salvage_pack_drops_an_object_failing_authentication(salvage_repository):
+    # a flipped byte in the data slot of the middle object: the header and metadata slot still validate,
+    # so the walk yields it, and authenticate rejects it.
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    (id0, obj0), (id1, obj1), (id2, obj2) = objs
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), flip=[last_byte_offset(objs, 1)])
+    list(salvage_repository.get_many([id0]))  # loads the pack into the pack cache
+
+    result = salvage(salvage_repository, repo_objs, pack_id)
+
+    assert result.status == SALVAGE_DONE
+    assert result.new_pack_id == store_hash(obj0 + obj2).digest()
+    assert result.kept == [(id0, 0, len(obj0)), (id2, len(obj0), len(obj2))]
+    assert result.dropped_bytes == len(obj1)
+    assert result.removed_ids == [id1]
+    assert store_contents(salvage_repository) == {bin_to_hex(result.new_pack_id): obj0 + obj2}
+    assert pack_id not in salvage_repository._pack_cache
+    assert id1 not in salvage_repository.chunks
+    assert bytes(salvage_repository.get(id0)) == obj0
+    assert bytes(salvage_repository.get(id2)) == obj2
+    assert salvage_repository.chunks[id2].size == 100  # a repointed entry keeps its size
+
+
+@pytest.mark.parametrize("field", ["magic", "metadata"])
+def test_salvage_pack_drops_an_object_the_walk_skips(salvage_repository, field):
+    # a flipped byte in the header magic or in the metadata slot of the middle object: the walk rejects
+    # its header, resyncs at the next object and never yields the damaged one to authenticate.
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    (id0, obj0), (id1, obj1), (id2, obj2) = objs
+    start = last_byte_offset(objs, 0) + 1  # the first byte of objs[1]
+    pos = {"magic": start, "metadata": start + RepoObj.obj_header.size + repo_objs.key.PAYLOAD_OVERHEAD}[field]
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), flip=[pos])
+    authenticate = whole_object_authenticator(repo_objs)
+    authenticated = []
+
+    def spy_authenticate(chunk_id, obj):
+        authenticated.append(chunk_id)
+        return authenticate(chunk_id, obj)
+
+    result = salvage(salvage_repository, repo_objs, pack_id, authenticate=spy_authenticate)
+
+    assert result.status == SALVAGE_DONE
+    assert authenticated == [id0, id2]
+    assert result.kept == [(id0, 0, len(obj0)), (id2, len(obj0), len(obj2))]
+    assert result.dropped_bytes == len(obj1)
+    assert result.removed_ids == [id1]
+    assert store_contents(salvage_repository) == {bin_to_hex(result.new_pack_id): obj0 + obj2}
+
+
+def test_salvage_pack_keeps_an_object_the_index_does_not_list(salvage_repository):
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    (id0, obj0), (id1, obj1), (id2, obj2) = objs
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=[0, 2], flip=[last_byte_offset(objs, 2)])
+
+    result = salvage(salvage_repository, repo_objs, pack_id)
+
+    assert result.status == SALVAGE_DONE
+    assert result.kept == [(id0, 0, len(obj0)), (id1, len(obj0), len(obj1))]
+    assert result.removed_ids == [id2]
+    entry = salvage_repository.chunks[id1]
+    assert (entry.flags, entry.size) == (ChunkIndex.F_USED, 0)  # the plaintext size is unknown
+    assert (entry.pack_id, entry.obj_offset, entry.obj_size) == (result.new_pack_id, len(obj0), len(obj1))
+    assert bytes(salvage_repository.get(id1)) == obj1
+
+
+def test_salvage_pack_leaves_a_pack_alone_if_nothing_authenticates(salvage_repository):
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    flip = [last_byte_offset(objs, i) for i in range(3)]
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), flip=flip)
+    packs_before, index_before = store_contents(salvage_repository), index_contents(salvage_repository.chunks)
+
+    result = salvage(salvage_repository, repo_objs, pack_id)
+
+    assert result.status == SALVAGE_NOTHING_AUTHENTICATES
+    assert result.new_pack_id is None
+    assert store_contents(salvage_repository) == packs_before
+    assert index_contents(salvage_repository.chunks) == index_before
+
+
+@pytest.mark.parametrize("tail", [b"x" * 10, b"junk" * 100], ids=["shorter-than-a-header", "longer"])
+def test_salvage_pack_drops_uncovered_trailing_bytes(salvage_repository, tail):
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), tail=tail)
+    index_before = index_contents(salvage_repository.chunks)
+    called = []
+
+    result = salvage(salvage_repository, repo_objs, pack_id, before_old_pack_delete=lambda: called.append(1))
+
+    assert result.status == SALVAGE_DONE
+    assert result.dropped_bytes == len(tail)
+    assert result.removed_ids == []
+    # the kept bytes are the original pack, so the replacement has the store hash name of the undamaged pack
+    # and the old pack is not deleted.
+    assert result.new_pack_id == pack_id
+    assert called == []
+    assert store_contents(salvage_repository) == {bin_to_hex(pack_id): b"".join(obj for _, obj in objs)}
+    assert index_contents(salvage_repository.chunks) == index_before
+    for chunk_id, obj in objs:
+        assert bytes(salvage_repository.get(chunk_id)) == obj
+
+
+def test_salvage_pack_refuses_with_a_pack_store_cache(tmp_path, monkeypatch):
+    # with BORG_STORE_CACHE, both loads of a pack can return the same cached copy.
+    monkeypatch.setenv("BORG_STORE_CACHE", os.fspath(tmp_path / "cache"))
+    with Repository(os.fspath(tmp_path / "repo"), exclusive=True, create=True) as repository:
+        repository.chunks = ChunkIndex()
+        repo_objs = plain_repo_objs()
+        objs = three_objects(repo_objs)
+        pack_id = store_damaged_pack(repository, objs, listed=range(3), flip=[last_byte_offset(objs, 1)])
+        with pytest.raises(Error, match="BORG_STORE_CACHE"):
+            salvage(repository, repo_objs, pack_id)
+        assert bin_to_hex(pack_id) in store_contents(repository)
+
+
+def test_salvage_pack_refuses_without_write_permission(salvage_repository):
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), flip=[last_byte_offset(objs, 1)])
+    packs_before, index_before = store_contents(salvage_repository), index_contents(salvage_repository.chunks)
+    salvage_repository.permissions = {"packs": "lrw", "index": "lrwWD"}  # packs/ has no delete
+    with pytest.raises(Repository.PermissionDenied):
+        salvage(salvage_repository, repo_objs, pack_id)
+    assert store_contents(salvage_repository) == packs_before
+    assert index_contents(salvage_repository.chunks) == index_before
+
+
+def test_salvage_pack_leaves_a_pack_alone_if_two_reads_differ(salvage_repository, monkeypatch):
+    # the first load has an extra flipped byte in object 0, the second load does not.
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), flip=[last_byte_offset(objs, 1)])
+    packs_before, index_before = store_contents(salvage_repository), index_contents(salvage_repository.chunks)
+    load = salvage_repository.store.load
+    loads = []
+
+    def flaky_load(name, **kwargs):
+        data = load(name, **kwargs)
+        loads.append(name)
+        if len(loads) == 1:
+            data = bytearray(data)
+            data[last_byte_offset(objs, 0)] ^= 0xFF
+            data = bytes(data)
+        return data
+
+    monkeypatch.setattr(salvage_repository.store, "load", flaky_load)
+
+    result = salvage(salvage_repository, repo_objs, pack_id)
+
+    assert result.status == SALVAGE_READS_DIFFER
+    assert len(loads) == 2
+    monkeypatch.undo()
+    assert store_contents(salvage_repository) == packs_before
+    assert index_contents(salvage_repository.chunks) == index_before
+
+
+def test_salvage_pack_leaves_a_pack_that_reads_intact_alone(salvage_repository, monkeypatch):
+    # the store hash does not match the name, but the loaded bytes do: the reads disagree, and no object
+    # is authenticated.
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3))
+    packs_before, index_before = store_contents(salvage_repository), index_contents(salvage_repository.chunks)
+    monkeypatch.setattr(salvage_repository.store, "hash", lambda name, algorithm: "0" * 64)
+    authenticated = []
+
+    def authenticate(chunk_id, obj):
+        authenticated.append(chunk_id)
+        return False
+
+    result = salvage(salvage_repository, repo_objs, pack_id, authenticate=authenticate)
+
+    assert result.status == SALVAGE_READS_DIFFER
+    assert authenticated == []
+    assert store_contents(salvage_repository) == packs_before
+    assert index_contents(salvage_repository.chunks) == index_before
+
+
+@pytest.mark.parametrize("method", ["hash", "load"])
+@pytest.mark.parametrize(
+    "error",
+    [OSError(5, "Input/output error"), BackendConnectionError("connection lost"), ReadRangeError("short read")],
+    ids=["OSError", "BackendConnectionError", "ReadRangeError"],
+)
+def test_salvage_pack_leaves_a_pack_alone_on_a_read_error(salvage_repository, monkeypatch, method, error):
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), flip=[last_byte_offset(objs, 1)])
+    packs_before, index_before = store_contents(salvage_repository), index_contents(salvage_repository.chunks)
+
+    def failing(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(salvage_repository.store, method, failing)
+
+    result = salvage(salvage_repository, repo_objs, pack_id)
+
+    assert result.status == SALVAGE_READ_ERROR
+    monkeypatch.undo()
+    assert store_contents(salvage_repository) == packs_before
+    assert index_contents(salvage_repository.chunks) == index_before
+
+
+@pytest.mark.parametrize("method", ["hash", "load"])
+@pytest.mark.parametrize(
+    "error", [BackendMustBeOpen("not open"), PermissionDenied("denied")], ids=["BackendMustBeOpen", "PermissionDenied"]
+)
+def test_salvage_pack_raises_other_backend_errors(salvage_repository, monkeypatch, method, error):
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), flip=[last_byte_offset(objs, 1)])
+    packs_before, index_before = store_contents(salvage_repository), index_contents(salvage_repository.chunks)
+
+    def failing(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(salvage_repository.store, method, failing)
+
+    with pytest.raises(type(error)):
+        salvage(salvage_repository, repo_objs, pack_id)
+    monkeypatch.undo()
+    assert store_contents(salvage_repository) == packs_before
+    assert index_contents(salvage_repository.chunks) == index_before
+
+
+def test_salvage_pack_raises_if_the_pack_is_missing(salvage_repository):
+    repo_objs = plain_repo_objs()
+    with pytest.raises(StoreObjectNotFound):
+        salvage(salvage_repository, repo_objs, bytes(32))
+
+
+def test_salvage_pack_updates_the_given_chunk_index(salvage_repository):
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), flip=[last_byte_offset(objs, 1)])
+    chunks = salvage_repository.chunks
+    salvage_repository.chunks = ChunkIndex()
+
+    result = salvage(salvage_repository, repo_objs, pack_id, chunks=chunks)
+
+    assert result.status == SALVAGE_DONE
+    assert result.removed_ids == [objs[1][0]]
+    assert chunks[objs[0][0]].pack_id == result.new_pack_id
+    assert index_contents(salvage_repository.chunks) == {}
+
+
+def test_salvage_pack_indexes_duplicates(salvage_repository):
+    # a chunk id indexed in another pack keeps its entry. The entry of a dropped object is pointed at a
+    # kept copy of the same chunk id in the pack.
+    repo_objs = plain_repo_objs()
+    id_a, obj_a = real_chunk(repo_objs, b"A" * 100)
+    id_b, obj_b = real_chunk(repo_objs, b"B" * 100)
+    id_c, obj_c = real_chunk(repo_objs, b"C" * 100)
+    other_pack_id = store_damaged_pack(salvage_repository, [(id_a, obj_a)], listed=[0])
+    objs = [(id_a, obj_a), (id_b, obj_b), (id_b, obj_b), (id_c, obj_c)]
+    # id_a is unlisted here, id_b is listed at its damaged first copy, id_c is listed and its only copy is damaged.
+    pack_id = store_damaged_pack(
+        salvage_repository, objs, listed=[1, 3], flip=[last_byte_offset(objs, 1), last_byte_offset(objs, 3)]
+    )
+
+    result = salvage(salvage_repository, repo_objs, pack_id)
+
+    assert result.status == SALVAGE_DONE
+    assert result.kept == [(id_a, 0, len(obj_a)), (id_b, len(obj_a), len(obj_b))]
+    assert result.removed_ids == [id_c]
+    assert salvage_repository.chunks[id_a].pack_id == other_pack_id
+    entry = salvage_repository.chunks[id_b]
+    assert (entry.pack_id, entry.obj_offset) == (result.new_pack_id, len(obj_a))
+
+
+def test_salvage_pack_order_of_changes(salvage_repository, monkeypatch):
+    # the replacement pack is stored first, then before_old_pack_delete runs while the index still points
+    # at the old pack, then the index is updated, and the old pack is deleted last.
+    repo_objs = plain_repo_objs()
+    objs = three_objects(repo_objs)
+    id0 = objs[0][0]
+    pack_id = store_damaged_pack(salvage_repository, objs, listed=range(3), flip=[last_byte_offset(objs, 1)])
+    events = []
+    store_store, store_delete = salvage_repository.store_store, salvage_repository.store_delete
+
+    def spy_store(name, value):
+        events.append(("store", name, salvage_repository.chunks[id0].pack_id))
+        return store_store(name, value)
+
+    def spy_delete(name, **kwargs):
+        events.append(("delete", name, salvage_repository.chunks[id0].pack_id))
+        return store_delete(name, **kwargs)
+
+    monkeypatch.setattr(salvage_repository, "store_store", spy_store)
+    monkeypatch.setattr(salvage_repository, "store_delete", spy_delete)
+
+    def before_old_pack_delete():
+        events.append(("marker", None, salvage_repository.chunks[id0].pack_id))
+
+    result = salvage(salvage_repository, repo_objs, pack_id, before_old_pack_delete=before_old_pack_delete)
+
+    new_name, old_name = "packs/" + bin_to_hex(result.new_pack_id), "packs/" + bin_to_hex(pack_id)
+    assert events == [("store", new_name, pack_id), ("marker", None, pack_id), ("delete", old_name, result.new_pack_id)]
+
+
+def create_repo_with_real_packs(location, repo_objs, packs=1):
+    # create <packs> packs of three real objects each and store the index.
+    # Returns [(objs, pack_id), ...], objs as returned by real_chunk.
+    result = []
+    with Repository(location, exclusive=True, create=True) as repository:
+        for p in range(packs):
+            objs = [real_chunk(repo_objs, bytes([p, i]) * 100) for i in range(3)]
+            for chunk_id, obj in objs:
+                repository.put(chunk_id, obj)
+            repository.flush()  # store a pack holding these objects
+            pack_id = repository.chunks[objs[0][0]].pack_id
+            assert all(repository.chunks[chunk_id].pack_id == pack_id for chunk_id, _ in objs)
+            result.append((objs, pack_id))
+    return result
+
+
+def damage_pack(repository, pack_id, flip=(), tail=b""):
+    # flip the bytes at the positions in flip and append tail; the pack keeps its name.
+    key = "packs/" + bin_to_hex(pack_id)
+    data = bytearray(repository.store_load(key))
+    for pos in flip:
+        data[pos] ^= 0xFF
+    repository.store_store(key, bytes(data) + tail)
+
+
+def rot_index(repository):
+    # flip the first byte of each index/ fragment; the fragment keeps its name.
+    for info in repository.store_list("index"):
+        name = f"index/{info.name}"
+        data = bytearray(repository.store_load(name))
+        data[0] ^= 0xFF
+        repository.store_store(name, bytes(data))
+
+
+def check_repair(repository, repo_objs, **kwargs):
+    kwargs.setdefault("authenticate", whole_object_authenticator(repo_objs))
+    return repository.check(repair=True, validate=object_validator(repo_objs), **kwargs)
+
+
+def pack_names(repository):
+    return {info.name for info in repository.store_list("packs")}
+
+
+@pytest.mark.parametrize("repo_only", [True, False])
+def test_check_repair_salvages_a_corrupt_pack(tmp_path, caplog, repo_only):
+    # a repair replaces a corrupt pack by one holding its objects that authenticate, removes the index
+    # entry of the dropped object, clears the pack's record and stores the index. The chunk is lost, so
+    # a repository-only run fails.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    (id0, obj0), (id1, obj1), (id2, obj2) = objs
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_id, flip=[last_byte_offset(objs, 1)])
+    new_pack_id = store_hash(obj0 + obj2).digest()
+    with Repository(location, exclusive=True) as repository:
+        with caplog.at_level(logging.WARNING, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=repo_only) is not repo_only
+        assert f"Salvaged corrupt pack {bin_to_hex(pack_id)}" in caplog.text
+        assert "corrupt pack(s) salvaged, chunks may be lost" in caplog.text
+        assert pack_names(repository) == {bin_to_hex(new_pack_id)}
+        assert PackTracker.load(repository).corrupt_ids() == []
+        assert not chunkindex_is_invalid(repository)  # the salvage stored the index
+    with Repository(location, exclusive=True) as repository:  # the stored index
+        assert id1 not in repository.chunks
+        assert repository.chunks[id0][2:] == (new_pack_id, 0, len(obj0))
+        assert repository.chunks[id2][2:] == (new_pack_id, len(obj0), len(obj2))
+        assert repository.check(repair=False) is True
+
+
+def test_check_repair_salvage_drops_appended_bytes(tmp_path, caplog):
+    # bytes appended to a pack: every object is kept, so the replacement pack is the original pack and
+    # nothing is lost; a repository-only run succeeds.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_id, tail=b"appended")
+        index_before = dict(repository.chunks.iteritems())
+    with Repository(location, exclusive=True) as repository:
+        with caplog.at_level(logging.INFO, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=True) is True
+        assert "Finished full repository check, repaired." in caplog.text
+        assert pack_names(repository) == {bin_to_hex(pack_id)}
+    with Repository(location, exclusive=True) as repository:
+        assert dict(repository.chunks.iteritems()) == index_before
+        assert repository.check(repair=False) is True
+
+
+def test_check_repair_reports_a_pack_that_reads_intact(tmp_path, caplog, monkeypatch):
+    # a pack whose first read hashes wrong and whose next read is intact: nothing is salvaged and the
+    # pack's record is set to intact, but the run fails, because no repair fixes unreliable storage.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    pack_hex = bin_to_hex(pack_id)
+    with Repository(location, exclusive=True) as repository:
+        index_before = dict(repository.chunks.iteritems())
+        store_hash_of = repository.store.hash
+        faulty_read = True
+
+        def hash(name, algorithm):
+            # only the pack check's read of this pack returns a wrong hash, the salvage's read is intact.
+            nonlocal faulty_read
+            if name == f"packs/{pack_hex}" and faulty_read:
+                faulty_read = False
+                return "0" * 64
+            return store_hash_of(name, algorithm)
+
+        monkeypatch.setattr(repository.store, "hash", hash)
+        with caplog.at_level(logging.WARNING, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=True) is False
+        assert f"Pack {pack_hex} read corrupt, then intact" in caplog.text
+        assert "1 pack(s) read corrupt, then intact" in caplog.text
+        assert "the storage or the transfer may be unreliable" in caplog.text
+        assert "repaired" not in caplog.text
+        assert pack_names(repository) == {pack_hex}
+        assert PackTracker.load(repository).corrupt_ids() == []
+    with Repository(location, exclusive=True) as repository:
+        assert dict(repository.chunks.iteritems()) == index_before
+        assert repository.check(repair=False) is True
+
+
+def test_check_repair_salvages_before_rebuilding_a_corrupt_index(tmp_path, caplog):
+    # a corrupt index and a corrupt pack: a repository-only repair salvages the pack, then rebuilds the
+    # index from the packs. The index can not tell what the dropped bytes held, so the run fails.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    (id0, _), (id1, _), (id2, _) = objs
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_id, flip=[last_byte_offset(objs, 1)])
+        rot_index(repository)
+    with Repository(location, exclusive=True) as repository:
+        with caplog.at_level(logging.INFO, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=True) is False
+        assert f"Salvaged corrupt pack {bin_to_hex(pack_id)}" in caplog.text
+        assert "Repository index was corrupted and has been rebuilt from the packs." in caplog.text
+        assert "corrupt pack(s) salvaged, chunks may be lost" in caplog.text
+        assert not chunkindex_is_invalid(repository)  # the rebuild stored the index
+    with Repository(location, exclusive=True) as repository:
+        assert id0 in repository.chunks and id2 in repository.chunks
+        assert id1 not in repository.chunks
+        assert repository.check(repair=False) is True
+
+
+def test_check_repair_salvages_without_a_stored_index(tmp_path):
+    # without index/ fragments, the salvage updates an empty ChunkIndex, stores no index and writes no
+    # invalid marker.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_id, flip=[last_byte_offset(objs, 1)])
+        delete_chunkindex_from_repo(repository)
+    with Repository(location, exclusive=True) as repository:
+        assert check_repair(repository, repo_objs, repo_only=False) is True
+        assert bin_to_hex(pack_id) not in pack_names(repository)
+        assert list(repository.store_list("index")) == []
+        assert not chunkindex_is_invalid(repository)
+    with Repository(location, exclusive=True) as repository:
+        assert repository.check(repair=False) is True
+
+
+def test_check_repair_without_authenticate_leaves_a_corrupt_pack(tmp_path, caplog):
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_id, flip=[last_byte_offset(objs, 1)])
+    with Repository(location, exclusive=True) as repository:
+        with caplog.at_level(logging.ERROR, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=True, authenticate=None) is False
+        assert "Not salvaging 1 corrupt pack(s): objects can not be authenticated" in caplog.text
+        assert "corrupt pack(s) left" in caplog.text
+        assert pack_names(repository) == {bin_to_hex(pack_id)}
+        assert PackTracker.load(repository).corrupt_ids() == [pack_id]
+
+
+def test_check_repair_skips_the_record_of_a_pack_gone(tmp_path):
+    # a pack recorded corrupt, then deleted (e.g. by compact, which deletes a pack whose objects are all
+    # unused): the repair salvages no pack and drops the record.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    create_repo_with_real_packs(location, repo_objs)
+    gone_id = bytes(32)
+    with Repository(location, exclusive=True) as repository:
+        tracker = PackTracker.load(repository)
+        tracker.record(gone_id, False)
+        tracker.save()
+    with Repository(location, exclusive=True) as repository:
+        assert check_repair(repository, repo_objs, repo_only=True) is True
+        assert PackTracker.load(repository).corrupt_ids() == []
+
+
+def test_check_repair_does_not_salvage_without_delete_permission(tmp_path, caplog, monkeypatch):
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_id, flip=[last_byte_offset(objs, 1)])
+    monkeypatch.setenv("BORG_REPO_PERMISSIONS", "no-delete")
+    with Repository(location, exclusive=True) as repository:
+        with caplog.at_level(logging.ERROR, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=True) is False
+        assert "Not salvaging 1 corrupt pack(s): Repository permission denied" in caplog.text
+        assert pack_names(repository) == {bin_to_hex(pack_id)}
+        assert PackTracker.load(repository).corrupt_ids() == [pack_id]
+        assert not chunkindex_is_invalid(repository)
+
+
+def test_check_repair_salvage_error_keeps_the_records_current(tmp_path, monkeypatch):
+    # an exception in the salvage of the second pack: the record of the first, salvaged pack is dropped,
+    # the second pack stays recorded corrupt and the stored index stays marked invalid.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    packs = create_repo_with_real_packs(location, repo_objs, packs=2)
+    with Repository(location, exclusive=True) as repository:
+        for objs, pack_id in packs:
+            damage_pack(repository, pack_id, flip=[last_byte_offset(objs, 1)])
+    salvage_pack = Repository.salvage_pack
+    salvaged = []
+
+    def salvage_pack_then_fail(self, pack_id, **kwargs):
+        if salvaged:
+            raise OSError("store failure")
+        salvaged.append(pack_id)
+        return salvage_pack(self, pack_id, **kwargs)
+
+    monkeypatch.setattr(Repository, "salvage_pack", salvage_pack_then_fail)
+    with Repository(location, exclusive=True) as repository:
+        with pytest.raises(OSError):
+            check_repair(repository, repo_objs, repo_only=True)
+    with Repository(location, exclusive=True) as repository:
+        [done_id] = salvaged
+        assert PackTracker.load(repository).corrupt_ids() == [p for _, p in packs if p != done_id]
+        assert chunkindex_is_invalid(repository)
+
+
+def test_check_repair_salvage_stores_an_empty_index(tmp_path, monkeypatch):
+    # a salvage that leaves the index empty: the repair stores the empty index, deleting the old
+    # fragments, before it deletes the invalid marker.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_id, flip=[last_byte_offset(objs, 1)])
+    salvage_pack = Repository.salvage_pack
+
+    def salvage_pack_then_empty_the_index(self, pack_id, **kwargs):
+        result = salvage_pack(self, pack_id, **kwargs)
+        chunks = kwargs["chunks"]
+        for chunk_id in [chunk_id for chunk_id, _ in chunks.iteritems()]:
+            del chunks[chunk_id]
+        return result
+
+    monkeypatch.setattr(Repository, "salvage_pack", salvage_pack_then_empty_the_index)
+    with Repository(location, exclusive=True) as repository:
+        check_repair(repository, repo_objs, repo_only=True)
+        assert not chunkindex_is_invalid(repository)
+    with Repository(location, exclusive=True) as repository:  # the stored index
+        assert len(repository.chunks) == 0
+
+
+def test_check_repair_leaves_a_pack_nothing_in_which_authenticates(tmp_path, caplog):
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_id, flip=[last_byte_offset(objs, i) for i in range(3)])
+    with Repository(location, exclusive=True) as repository:
+        with caplog.at_level(logging.ERROR, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=True) is False
+        assert f"Corrupt pack {bin_to_hex(pack_id)} was not salvaged: {SALVAGE_NOTHING_AUTHENTICATES}." in caplog.text
+        assert pack_names(repository) == {bin_to_hex(pack_id)}
+        assert PackTracker.load(repository).corrupt_ids() == [pack_id]
+
+
+def test_check_repair_does_not_salvage_with_a_pack_store_cache(tmp_path, caplog, monkeypatch):
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_id, flip=[last_byte_offset(objs, 1)])
+    with Repository(location, exclusive=True) as repository:
+        monkeypatch.setattr(repository, "uses_pack_store_cache", True)
+        with caplog.at_level(logging.ERROR, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=True) is False
+        assert "Not salvaging 1 corrupt pack(s): BORG_STORE_CACHE is set." in caplog.text
+        assert pack_names(repository) == {bin_to_hex(pack_id)}
+
+
+def test_check_repair_salvage_interrupted(tmp_path, monkeypatch):
+    # a Ctrl-C during the salvage stops it after the current pack: the salvaged pack is indexed and its
+    # record cleared, the other pack stays recorded corrupt.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    packs = create_repo_with_real_packs(location, repo_objs, packs=2)
+    with Repository(location, exclusive=True) as repository:
+        for objs, pack_id in packs:
+            damage_pack(repository, pack_id, flip=[last_byte_offset(objs, 1)])
+    interrupter = Interrupter()
+    salvage_pack = Repository.salvage_pack
+    salvaged = []
+
+    def salvage_pack_then_interrupt(self, pack_id, **kwargs):
+        result = salvage_pack(self, pack_id, **kwargs)
+        salvaged.append((pack_id, result.new_pack_id))
+        interrupter.triggered = True  # one Ctrl-C after the first salvage
+        return result
+
+    monkeypatch.setattr(repository_module, "sig_int", interrupter)
+    monkeypatch.setattr(Repository, "salvage_pack", salvage_pack_then_interrupt)
+    with Repository(location, exclusive=True) as repository:
+        assert check_repair(repository, repo_objs, repo_only=True) is False
+        [(done_id, new_pack_id)] = salvaged
+        assert PackTracker.load(repository).corrupt_ids() == [p for _, p in packs if p != done_id]
+        assert not chunkindex_is_invalid(repository)
+    interrupter.triggered = False
+    with Repository(location, exclusive=True) as repository:  # the stored index
+        done_objs = next(objs for objs, pack_id in packs if pack_id == done_id)
+        assert repository.chunks[done_objs[0][0]].pack_id == new_pack_id
+        assert done_objs[1][0] not in repository.chunks
+
+
+def test_check_repair_max_age_skips_a_pack_recorded_intact(tmp_path, monkeypatch):
+    # a repair reuses intact records: a pack recorded intact within max_age is not re-verified.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        tracker = PackTracker.new(repository)
+        tracker.record(pack_id, ok=True)  # fresh timestamp
+        tracker.save()
+    with Repository(location, exclusive=True) as repository:
+        hashed_keys = _spy_hash(repository, monkeypatch)
+        assert check_repair(repository, repo_objs, repo_only=True, max_age=3600) is True
+        assert "packs/" + bin_to_hex(pack_id) not in hashed_keys
+
+
+def test_check_repair_max_age_salvages_the_pack_recorded_corrupt(tmp_path, caplog, monkeypatch):
+    # a pack recorded corrupt is re-verified and salvaged, also when max_age skips every other pack.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    (objs_a, pack_a), (objs_b, pack_b) = create_repo_with_real_packs(location, repo_objs, packs=2)
+    with Repository(location, exclusive=True) as repository:
+        damage_pack(repository, pack_b, flip=[last_byte_offset(objs_b, 1)])
+        tracker = PackTracker.new(repository)
+        tracker.record(pack_a, ok=True)  # fresh timestamp
+        tracker.record(pack_b, ok=False)
+        tracker.save()
+    new_pack_b = store_hash(objs_b[0][1] + objs_b[2][1]).digest()
+    with Repository(location, exclusive=True) as repository:
+        hashed_keys = _spy_hash(repository, monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=False, max_age=3600) is True
+        assert "packs/" + bin_to_hex(pack_a) not in hashed_keys  # its intact record is fresh
+        assert "packs/" + bin_to_hex(pack_b) in hashed_keys  # recorded corrupt, so re-verified
+        assert f"Salvaged corrupt pack {bin_to_hex(pack_b)}" in caplog.text
+        assert pack_names(repository) == {bin_to_hex(pack_a), bin_to_hex(new_pack_b)}
+
+
+def test_check_repair_repo_only_ignores_max_age_with_a_corrupt_index(tmp_path, caplog, monkeypatch):
+    # a repository-only repair rebuilds the corrupt index from the packs it verified in this run, so it
+    # verifies every pack and reuses no record.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        rot_index(repository)
+        tracker = PackTracker.new(repository)
+        tracker.record(pack_id, ok=True)  # fresh timestamp
+        tracker.save()
+    with Repository(location, exclusive=True) as repository:
+        hashed_keys = _spy_hash(repository, monkeypatch)
+        with caplog.at_level(logging.INFO, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=True, max_age=3600) is True
+        assert "Ignoring --max-age" in caplog.text
+        assert "packs/" + bin_to_hex(pack_id) in hashed_keys
+
+
+def test_check_repair_repo_only_ignores_max_age_with_a_fragment_failing_authentication(tmp_path, caplog, monkeypatch):
+    # a fragment that matches its name, but fails the authentication, is found by the index cross-check
+    # only. The repair then also verifies every pack, reuses no record and rebuilds the index.
+    repo_objs = plain_repo_objs()
+    location = os.fspath(tmp_path / "repo")
+    [(objs, pack_id)] = create_repo_with_real_packs(location, repo_objs)
+    with Repository(location, exclusive=True) as repository:
+        with io.BytesIO() as f:
+            ChunkIndex().write(f)
+            data = f.getvalue()  # plaintext, not in the key's envelope
+        name = store_hash(data).hexdigest()
+        repository.store_store(f"index/{name}", data)
+        tracker = PackTracker.new(repository)
+        tracker.record(pack_id, ok=True)  # fresh timestamp
+        tracker.save()
+    with Repository(location, exclusive=True) as repository:
+        hashed_keys = _spy_hash(repository, monkeypatch)
+        with caplog.at_level(logging.INFO, logger="borg.repository"):
+            assert check_repair(repository, repo_objs, repo_only=True, max_age=3600) is True
+        assert "Ignoring --max-age" in caplog.text
+        assert "packs/" + bin_to_hex(pack_id) in hashed_keys
+        assert name not in {info.name for info in repository.store_list("index")}
+        assert repository.check(repair=False) is True

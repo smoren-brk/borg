@@ -318,8 +318,8 @@ def ChunkerParams(s):
         if block_size > MAX_DATA_SIZE or header_size > MAX_DATA_SIZE:
             raise ArgumentTypeError("block_size and header_size must not exceed MAX_DATA_SIZE [%d]" % MAX_DATA_SIZE)
         return algo, block_size, header_size
-    if algo == "default" and count == 1:  # default
-        return CHUNKER_PARAMS
+    if algo == "default" and count == 1:  # the repository default or CHUNKER_PARAMS, see with_repository
+        return DEFAULT_CHUNKER_PARAMS
     if algo == CH_BUZHASH64:
         # buzhash64, chunk_min, chunk_max, chunk_mask, window_size, nc_level
         # use nc_level 0 to disable normalized chunking.
@@ -767,15 +767,15 @@ class Location:
     # passes the raw URL through. covers both "scheme://..." and opaque "scheme:..." forms.
     BORGSTORE_SCHEMES = ("sftp", "http", "https", "s3", "b2", "rclone")
 
-    # locations that borg parses itself, see ssh_re / rest_re / file_re below.
-    BORG_SCHEMES = ("ssh", "rest", "file")
+    # locations that borg parses itself, see ssh_re / file_re below.
+    BORG_SCHEMES = ("ssh", "file")
 
     # path may contain any chars, but to avoid ambiguities with the other regexes it must not start
     # with any of the scheme specifiers above (all of which are matched before local_re in _parse).
     # Rejecting them here makes a malformed URL fail with a helpful error instead of being silently
-    # taken for a local path - e.g. "rest://host/" used to end up as the local directory
-    # "./rest:/host", see #10215. A local path that really starts with such a prefix can still be
-    # used by prefixing it with "./" (or by giving it as an absolute path).
+    # taken for a local path - e.g. "ssh://host/" would end up as the local directory "./ssh:/host",
+    # see #10215. A local path that really starts with such a prefix can still be used by prefixing
+    # it with "./" (or by giving it as an absolute path).
     local_path_re = r"(?!(?:" + "|".join(BORG_SCHEMES + BORGSTORE_SCHEMES) + r"):)" r"(?P<path>.+)"
 
     # abs_path must start with a slash (or drive letter on Windows).
@@ -785,29 +785,18 @@ class Location:
     abs_or_rel_path_re = r"(?P<path>.+)"
 
     # We only parse out individual fields (user/host/port/path) for the protocols where borg
-    # itself needs them: legacy "ssh" (v1 repositories) and "rest" (for the ssh tunnel + FILE
-    # backend), plus local "file" paths. Everything else (see BORGSTORE_SCHEMES) is handed to
-    # borgstore as the raw URL and parsed/validated there - we only detect the scheme.
+    # itself needs them: "ssh" (for the ssh command line and the FILE backend path) plus local
+    # "file" paths. Everything else (see BORGSTORE_SCHEMES) is handed to borgstore as the raw URL
+    # and parsed/validated there - we only detect the scheme.
 
-    # ssh:// is only used for legacy borg 1.x repositories nowadays.
+    # ssh:// reaches a remote "borg serve" via ssh: for current repositories, borg talks HTTP (REST)
+    # over the ssh connection's stdio; for legacy borg 1.x repositories (--from-borg1), it uses the
+    # legacy RPC protocol.
     ssh_re = re.compile(
         r"(?P<proto>ssh)://"
         + optional_user_re
         + host_re
         + optional_port_re
-        + r"/"  # this is the separator, not part of the path!
-        + abs_or_rel_path_re,
-        re.VERBOSE,
-    )
-
-    # REST http via stdio (via ssh, if host given):
-    rest_re = re.compile(
-        r"(?P<proto>(rest))://"
-        + r"("
-        + optional_user_re
-        + host_re
-        + optional_port_re
-        + r")?"
         + r"/"  # this is the separator, not part of the path!
         + abs_or_rel_path_re,
         re.VERBOSE,
@@ -823,8 +812,6 @@ class Location:
 
     # accepted forms per scheme borg parses itself, used to explain a URL we could not parse.
     scheme_hints = {
-        "rest": "rest://[user@]host[:port]/path/to/repo (path relative to the remote directory ssh "
-        "logs into) or rest://[user@]host[:port]//path/to/repo (absolute path)",
         "ssh": "ssh://[user@]host[:port]/path/to/repo (path relative to the remote directory ssh "
         "logs into) or ssh://[user@]host[:port]//path/to/repo (absolute path)",
         "file": "file:///C:/path/to/repo" if is_win32 else "file:///path/to/repo",
@@ -881,15 +868,6 @@ class Location:
             # remote path: normalize with posixpath, not with the client's os.path, see #10199.
             self.path = posixpath.normpath(m.group("path"))
             return True
-        m = self.rest_re.match(text)
-        if m:
-            self.proto = m.group("proto")
-            self.user = m.group("user")
-            self._host = m.group("host")
-            self.port = m.group("port") and int(m.group("port")) or None
-            # remote path: normalize with posixpath, not with the client's os.path, see #10199.
-            self.path = posixpath.normpath(m.group("path"))
-            return True
         m = self.file_re.match(text)
         if m:
             self.proto = m.group("proto")
@@ -932,7 +910,7 @@ class Location:
     def canonical_path(self):
         if self.proto == "file":
             return normalize_local_path(self.path)
-        if self.proto in ("rest", "ssh"):
+        if self.proto == "ssh":
             return (
                 f"{self.proto}://"
                 f"{(self.user + '@') if self.user else ''}"
@@ -1156,7 +1134,9 @@ class ArchiveFormatter(BaseFormatter):
         self.key = key
         self.name = None
         self.id = None
+        self.archive_info = None
         self._archive = None
+        self._archive_id = None  # the id self._archive was loaded for (self._archive can be None)
         self.deleted = deleted  # True if we want to deal with deleted archives.
         self.format_keys = {f[1] for f in Formatter().parse(format)}
         self.call_keys = {
@@ -1175,6 +1155,7 @@ class ArchiveFormatter(BaseFormatter):
     def get_item_data(self, archive_info, jsonline=False):
         self.name = archive_info.name
         self.id = archive_info.id
+        self.archive_info = archive_info
         item_data = {}
         item_data |= {} if jsonline else self.static_data
         item_data |= {
@@ -1195,27 +1176,38 @@ class ArchiveFormatter(BaseFormatter):
 
     @property
     def archive(self):
-        """lazy load / update loaded archive"""
-        if self._archive is None or self._archive.id != self.id:
+        """lazy load / update loaded archive, None if the archive has no valid metadata object"""
+        if self._archive_id != self.id:
             from ..archive import Archive
 
-            self._archive = Archive(self.manifest, self.id, deleted=self.deleted)
+            # the ArchiveInfo usually carries the archive's metadata, so this does not need to load it again.
+            try:
+                self._archive = Archive(self.manifest, self.archive_info, deleted=self.deleted)
+            except Archive.DoesNotExist:
+                # the archives directory lists it, but its metadata object is missing or invalid, so we only
+                # have the placeholder values of the ArchiveInfo (see Archives._parse_archive_meta).
+                self._archive = None
+            self._archive_id = self.id
         return self._archive
 
     def get_meta(self, key, default=None):
-        return self.archive.metadata.get(key, default)
+        archive = self.archive
+        return archive.metadata.get(key, default) if archive is not None else default
 
     def get_ts_start(self):
-        return self.format_time(self.archive.ts_start)
+        archive = self.archive
+        return self.format_time(archive.ts_start if archive is not None else self.archive_info.ts)
 
     def get_ts_end(self):
-        return self.format_time(self.archive.ts_end)
+        archive = self.archive
+        return self.format_time(archive.ts_end if archive is not None else self.archive_info.ts)
 
     def format_time(self, ts):
         return OutputTimestamp(ts)
 
     def get_tags(self):
-        return ",".join(sorted(self.archive.tags))
+        archive = self.archive
+        return ",".join(sorted(archive.tags if archive is not None else self.archive_info.tags))
 
 
 class ItemFormatter(BaseFormatter):
@@ -1576,6 +1568,8 @@ def ellipsis_truncate(msg, space):
     """
     shorten a long string by adding ellipsis between it and return it, example:
     this_is_a_very_long_string -------> this_is..._string
+
+    The result is padded with spaces to a width of *space* terminal cells (if *space* >= 3).
     """
     from ..platform import swidth
 
@@ -1585,7 +1579,9 @@ def ellipsis_truncate(msg, space):
         # if there is very little space, just show ...
         return "..." + " " * (space - ellipsis_width)
     if space < ellipsis_width + msg_width:
-        return f"{swidth_slice(msg, space // 2 - ellipsis_width)}...{swidth_slice(msg, -space // 2)}"
+        # swidth_slice does not split a wide character, so a slice can be one cell short: pad below.
+        msg = f"{swidth_slice(msg, space // 2 - ellipsis_width)}...{swidth_slice(msg, -space // 2)}"
+        msg_width = swidth(msg)
     return msg + " " * (space - msg_width)
 
 

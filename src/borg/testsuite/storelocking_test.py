@@ -1,4 +1,6 @@
 import datetime
+import functools
+import json
 import os
 import time
 from pathlib import Path
@@ -8,8 +10,28 @@ import pytest
 from borgstore.store import ObjectNotFound, Store
 
 from .fslocking_test import free_pid  # NOQA
+from ..crypto.key import AESOCBKey, store_hash
 from ..platform import get_process_id
-from ..storelocking import Lock, NotLocked, LockTimeout
+from .. import storelocking
+from ..helpers import Error
+from ..storelocking import NotLocked, LockTimeout
+
+LOCK_KEY = AESOCBKey(None)
+LOCK_KEY.init_from_random_data()
+LOCK_KEY.init_ciphers()
+LOCK_AAD = b"test lock aad"
+
+
+def seal(value):
+    return LOCK_KEY.encrypt_oneshot(b"", value, aad=LOCK_AAD)
+
+
+def unseal(envelope):
+    return LOCK_KEY.decrypt(b"", envelope, aad=LOCK_AAD)
+
+
+# all locks in these tests seal their lock objects with the same key, like the clients of one repository.
+Lock = functools.partial(storelocking.Lock, seal=seal, unseal=unseal)
 
 ID1 = "foo", 1, 1
 ID2 = "bar", 2, 2
@@ -91,6 +113,31 @@ class TestLock:
             locks = shared_lock._get_locks()
             assert len(locks) == 1  # only the non-exclusive lock of ID1 is left
             assert not any(lock["exclusive"] for lock in locks.values())
+
+    def test_exclusive_lock_on_slow_store(self, lockstore, monkeypatch):
+        # An exclusive lock is acquired if no other lock exists, even if writing our lock object
+        # takes longer than the timeout.
+        orig_store = lockstore.store
+
+        def slow_store(name, value):
+            time.sleep(0.2)
+            return orig_store(name, value)
+
+        monkeypatch.setattr(lockstore, "store", slow_store)
+        with Lock(lockstore, exclusive=True, id=ID1, timeout=0.1) as lock:
+            assert lock.got_exclusive_lock()
+
+    @pytest.mark.parametrize("exclusive", [True, False])
+    def test_lock_timeout_zero(self, lockstore, exclusive):
+        # With timeout 0, a lock is acquired if nothing blocks it, and a blocked acquire does not wait.
+        with Lock(lockstore, exclusive=exclusive, id=ID1, timeout=0) as lock:
+            assert lock.got_exclusive_lock() == exclusive
+            blocked = Lock(lockstore, exclusive=True, id=ID2, timeout=0)
+            blocked.retry_delay_min = blocked.retry_delay_max = 60
+            start = time.monotonic()
+            with pytest.raises(LockTimeout):
+                blocked.acquire()
+            assert time.monotonic() - start < 30  # it did not sleep before retrying
 
     def test_double_nonexclusive_lock_succeeds(self, lockstore):
         with Lock(lockstore, exclusive=False, id=ID1):
@@ -414,3 +461,107 @@ class TestLock:
         assert len(old_locks) == len(new_locks) == 1
         assert old_locks[0]["hostid"] == old_id[0]
         assert new_locks[0]["hostid"] == new_id[0]
+
+
+def test_lock_object_is_sealed(lockstore):
+    # neither the content nor the name of a lock object tells who uses the repository, see "Lock objects".
+    lock = Lock(lockstore, exclusive=True, id=("secret-host@1234", 4711, 0)).acquire()
+    (info,) = list(lockstore.list("locks"))
+    content = lockstore.load(f"locks/{info.name}")
+    assert b"secret-host" not in content and b"4711" not in content
+    assert info.name == store_hash(content).hexdigest()  # the name is the hash of the sealed content
+    plain = json.loads(unseal(content))
+    assert (plain["hostid"], plain["processid"], plain["threadid"]) == ("secret-host@1234", 4711, 0)
+    assert info.name != store_hash(json.dumps(plain).encode()).hexdigest()
+    lock.release()
+
+
+@pytest.mark.parametrize("value, expected", [(None, 0.01), ("", 0.01), ("0", 0.0), ("2", 2.0), ("0.5", 0.5)])
+def test_race_recheck_delay_from_env(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("BORG_LOCK_RECHECK_DELAY", raising=False)
+    else:
+        monkeypatch.setenv("BORG_LOCK_RECHECK_DELAY", value)
+    assert storelocking.get_race_recheck_delay() == expected
+
+
+@pytest.mark.parametrize("value", ["abc", "-1", "nan", "inf"])
+def test_race_recheck_delay_from_env_invalid(monkeypatch, lockstore, value):
+    monkeypatch.setenv("BORG_LOCK_RECHECK_DELAY", value)
+    with pytest.raises(Error, match="BORG_LOCK_RECHECK_DELAY"):
+        Lock(lockstore, exclusive=True, id=ID1)
+
+
+@pytest.mark.parametrize("exclusive", [True, False])
+def test_acquire_waits_race_recheck_delay(monkeypatch, lockstore, exclusive):
+    # acquire() waits for the configured delay between creating its lock object and listing again.
+    monkeypatch.setenv("BORG_LOCK_RECHECK_DELAY", "1.5")
+    sleeps = []
+    monkeypatch.setattr(storelocking.time, "sleep", sleeps.append)
+    lock = Lock(lockstore, exclusive=exclusive, id=ID1).acquire()
+    assert sleeps == [1.5]
+    lock.release()
+
+
+def write_unreadable_lock(lockstore, content, *, mtime=None):
+    key = store_hash(content).hexdigest()
+    lockstore.store(f"locks/{key}", content)
+    if mtime is not None:
+        os.utime(lockstore.backend.base_path / "locks" / key, (mtime, mtime))
+    return key
+
+
+def plaintext_lock():
+    # a lock object as written without sealing (e.g. by an older borg 2 beta).
+    now = datetime.datetime.now(datetime.UTC).isoformat(timespec="milliseconds")
+    return json.dumps(dict(exclusive=False, hostid="other", processid=1, threadid=0, time=now)).encode()
+
+
+def foreign_key_lock():
+    # a lock object sealed with another key (e.g. from another repository).
+    other_key = AESOCBKey(None)
+    other_key.init_from_random_data()
+    other_key.init_ciphers()
+    now = datetime.datetime.now(datetime.UTC).isoformat(timespec="milliseconds")
+    lock = dict(exclusive=False, hostid="other", processid=1, threadid=0, time=now)
+    return other_key.encrypt_oneshot(b"", json.dumps(lock).encode(), aad=LOCK_AAD)
+
+
+class TestUnreadableLock:
+    @pytest.mark.parametrize("make_content", [plaintext_lock, foreign_key_lock, lambda: b"garbage"])
+    @pytest.mark.parametrize("exclusive", [False, True])
+    def test_blocks(self, lockstore, caplog, make_content, exclusive):
+        # fail closed: an unreadable lock object is treated as a foreign exclusive lock.
+        key = write_unreadable_lock(lockstore, make_content())
+        lock = Lock(lockstore, exclusive=exclusive, id=ID1, timeout=0.2)
+        lock.retry_delay_min = lock.retry_delay_max = 0.05
+        with caplog.at_level("INFO", logger="borg.storelocking"):
+            with pytest.raises(LockTimeout, match=f"unreadable lock object locks/{key}"):
+                lock.acquire()
+        warnings = [r for r in caplog.records if r.levelname == "WARNING" and "unreadable lock object" in r.message]
+        assert len(warnings) == 1  # only once per Lock instance
+        assert key in [info.name for info in lockstore.list("locks")]  # it was not deleted
+
+    def test_stale_by_store_mtime(self, lockstore):
+        # the store confirms that it was not written for longer than the stale timeout: it gets deleted.
+        key = write_unreadable_lock(lockstore, b"garbage", mtime=time.time() - 3600)
+        with Lock(lockstore, exclusive=True, id=ID1, stale=2) as lock:
+            assert list(lock._get_locks()) == [lock.my_lock_key]
+        assert key not in [info.name for info in lockstore.list("locks")]
+
+    def test_not_stale_if_recently_written(self, lockstore):
+        key = write_unreadable_lock(lockstore, b"garbage")
+        lock = Lock(lockstore, exclusive=False, id=ID1, stale=2, timeout=0.2)
+        lock.retry_delay_min = lock.retry_delay_max = 0.05
+        with pytest.raises(LockTimeout):
+            lock.acquire()
+        assert key in [info.name for info in lockstore.list("locks")]
+
+    def test_break_lock(self, lockstore, caplog):
+        key = write_unreadable_lock(lockstore, b"garbage")
+        with caplog.at_level("INFO", logger="borg.storelocking"):
+            Lock(lockstore, id=ID1).break_lock()
+        assert [r.message for r in caplog.records] == [f"Breaking unreadable lock object locks/{key}."]
+        assert list(lockstore.list("locks")) == []
+        with Lock(lockstore, exclusive=True, id=ID1):
+            pass

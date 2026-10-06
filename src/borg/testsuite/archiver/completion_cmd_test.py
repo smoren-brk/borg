@@ -8,7 +8,7 @@ import tempfile
 import pytest
 
 import borg
-from ...archiver.completion_cmd import TCSH_SORTBY_FN
+from ...archiver.completion_cmd import TCSH_REPO_URL_RULE, TCSH_SORTBY_FN
 from ...archiver.repo_create_cmd import ENCRYPTION_DESCRIPTIONS
 from . import cmd, generate_archiver_tests, RK_ENCRYPTION
 
@@ -164,7 +164,7 @@ def test_tcsh_completion_dynamic_helpers(archivers, request):
     assert "aid:{id}{NL}" in helper and "{archive}{NL}" in helper and "{tags}{NL}" in helper
     assert "`" not in helper, "backquotes in the helper would nest inside the completion rules"
     assert "eval _borg_complete_archive" in output, "archive completion not used for ARCHIVE"
-    assert "'n/--tags/`_borg_complete_tags`/'" in output, "tag completion not used for --tags"
+    assert "'n/--tag/`_borg_complete_tags`/'" in output, "tag completion not used for --tag"
 
 
 def test_tcsh_completion_positional_patterns(archivers, request):
@@ -596,14 +596,69 @@ def test_completion_falls_back_to_borg(archivers, request, shell, monkeypatch):
 def test_completion_repo_is_a_directory(archivers, request, shell):
     """-r/--repo and --other-repo complete local repository directories."""
     lines = completion_lines(archivers, request, shell)
-    # how each shell spells "complete directories", and how it refers to the two options
-    directory, repo, other_repo = {
-        "bash": ("_shtab_compgen_dirs", "_shtab_borg___repo_COMPGEN=", "_shtab_borg_repo_create___other_repo_COMPGEN="),
-        "zsh": ("_files -/", "{-r,--repo}", '"--other-repo['),
-        "fish": ("__fish_complete_directories", " -l repo ", " -l other-repo "),
+    # the helper completing directories (but not for a URL), and how each shell refers to the two options
+    directory = "_borg_complete_repo_dirs"
+    repo, other_repo = {
+        "bash": ("_shtab_borg___repo_COMPGEN=", "_shtab_borg_repo_create___other_repo_COMPGEN="),
+        "zsh": ("{-r,--repo}", '"--other-repo['),
+        "fish": (" -l repo ", " -l other-repo "),
     }[shell]
     assert any(repo in line and directory in line for line in lines), "-r/--repo does not complete directories"
     assert any(other_repo in line and directory in line for line in lines), "--other-repo does not complete dirs"
+
+
+# repository URLs: no directories must be completed for them, see #10460
+REPO_URLS = ["ssh://", "ssh://host/", "sftp://", "rclone:", "s3:", "b2:", "http://", "https://"]
+
+
+@needs_bash4
+def test_bash_repo_url_no_directories(archivers, request, tmp_path):
+    archiver = request.getfixturevalue(archivers)
+    (tmp_path / "somerepo").mkdir()
+    for url in REPO_URLS:
+        # a local directory looking like the start of the URL, so that plain directory completion finds it
+        (tmp_path / url.split("/")[0]).mkdir(exist_ok=True)
+    script = cmd(archiver, "completion", "bash")
+    for url in REPO_URLS:
+        result = _run_bash_completion_fn(script, f'cd "{tmp_path}"\n_borg_complete_repo_dirs "{url}"\n')
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert result.stdout == "", f"directories offered for {url}: {result.stdout}"
+    result = _run_bash_completion_fn(script, f'cd "{tmp_path}"\n_borg_complete_repo_dirs some\n')
+    assert result.stdout.split() == ["somerepo"]
+
+
+@needs_zsh
+def test_zsh_repo_url_no_directories(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    script = cmd(archiver, "completion", "zsh")
+    # stub the zsh directory completion, it needs the whole completion system
+    setup = '_files() { print -r -- COMPLETING-DIRS "$@" }\n'
+    for url in REPO_URLS:
+        result = _run_zsh_completion_fn(script, setup + f"PREFIX='{url}'\n_borg_complete_repo_dirs\n")
+        assert "COMPLETING-DIRS" not in result.stdout, f"directories offered for {url}"
+    # the arguments (_arguments gives the description of the option value) are passed on
+    result = _run_zsh_completion_fn(script, setup + "PREFIX=/some/dir\n_borg_complete_repo_dirs -X REPO\n")
+    assert result.stdout.split() == ["COMPLETING-DIRS", "-/", "-X", "REPO"]
+
+
+@needs_fish
+def test_fish_repo_url_no_directories(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    script = cmd(archiver, "completion", "fish")
+    for url in REPO_URLS:
+        for cmdline in (f"borg repo-create --repo={url}", f"borg repo-create -r {url}", f"borg repo-create -r{url}"):
+            candidates = _fish_complete_candidates(script, cmdline)
+            assert candidates == [], f"directories offered for {cmdline}: {candidates}"
+        candidates = _fish_complete_candidates(script, f"borg transfer --other-repo {url}")
+        assert candidates == [], f"directories offered for --other-repo {url}: {candidates}"
+
+
+def test_tcsh_repo_url_no_directories(archivers, request):
+    """tcsh uses the first matching rule, the one completing nothing for URLs must precede the directory ones."""
+    lines = [line.strip().rstrip(" \\") for line in completion_lines(archivers, request, "tcsh")]
+    url_rule = lines.index(TCSH_REPO_URL_RULE)
+    for repo_rule in ("'c/--repo=/d/'", "'n/--repo/d/'", "'n/-r/d/'", "'c/--other-repo=/d/'", "'n/--other-repo/d/'"):
+        assert url_rule < lines.index(repo_rule)
 
 
 @needs_fish
@@ -619,6 +674,9 @@ def test_fish_repo_directory_completion(archivers, request, tmp_path):
         candidates = _fish_complete_candidates(script, f"borg list {option} {prefix}")
         assert any(c.rstrip("/").endswith("somerepo") for c in candidates), f"repo dir missing: {candidates}"
         assert not any(c.endswith("somefile.txt") for c in candidates), f"file offered: {candidates}"
+    # the value attached to the short option
+    candidates = _fish_complete_candidates(script, f"borg list -r{prefix}")
+    assert [c.rstrip("/") for c in candidates] == [f"-r{prefix}repo"]
 
 
 @needs_fish

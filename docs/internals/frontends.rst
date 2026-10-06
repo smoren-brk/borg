@@ -345,7 +345,14 @@ path
     Path to the local repository cache
 
 :ref:`borg_repo-info` additionally emits a *security_dir* key with the path of the local security
-directory of the repository.
+directory of the repository and a *defaults* key with an object containing:
+
+compression
+    The compression spec the commands use if no compression is given: the repository default (see
+    :ref:`borg_repo-create` ``--compression``), else ``lz4``
+chunker_params
+    The chunker params the commands use if no chunker params are given: the repository default (see
+    :ref:`borg_repo-create` ``--chunker-params``), else the built-in default
 
 .. highlight: json
 
@@ -354,6 +361,10 @@ Example ``borg repo-info --json`` output::
     {
         "cache": {
             "path": "/home/user/.cache/borg/65d7898e2142485f44506fb11c0fcd6d7dfd0341716385246068584a62632a94"
+        },
+        "defaults": {
+            "chunker_params": "fastcdc,19,23,21,2",
+            "compression": "lz4"
         },
         "encryption": {
             "encryption": "aes256-ocb",
@@ -814,8 +825,12 @@ Errors
 
     Buffer.MemoryLimitExceeded rc: 2 traceback: no
         Requested buffer size {} is above the limit of {}.
+    ChunkIndexRebuildInterrupted rc: 2 traceback: no
+        Got Ctrl-C / SIGINT: the chunk index rebuild was interrupted.
     EfficientCollectionQueue.SizeUnderflow rc: 2 traceback: no
         Could not pop the first {} elements; collection only has {} elements.
+    ObjectsNotAuthenticatable rc: 2 traceback: no
+        Objects can not be authenticated with BORG_WORKAROUNDS=authenticated_no_key.
     RTError rc: 2 traceback: no
         Runtime error: {}
 
@@ -835,6 +850,8 @@ Errors
         {} has no repository config.
     Repository.CheckNeeded rc: 12 traceback: yes
         Inconsistency detected. Please run "borg check {}".
+    Repository.DefaultsMissing rc: 34 traceback: no
+        Repository {} has no config/defaults object, run "borg check --repair" to store empty defaults.
     Repository.DoesNotExist rc: 13 traceback: no
         Repository {} does not exist.
     Repository.InsufficientFreeSpaceError rc: 14 traceback: no
@@ -857,6 +874,10 @@ Errors
         Object with key {} is indexed to pack {}, but that whole pack is missing from repository {}.
     Repository.PermissionDenied rc: 24 traceback: no
         Repository permission denied: {}
+    Repository.KeyRequired rc: 28 traceback: yes
+        Repository {} needs its key to access the store object {}, but no key was set.
+    Repository.LegacyRepository rc: 29 traceback: no
+        {} looks like a borg 1.x repository, use --from-borg1 to access it (e.g. with borg transfer).
 
     MandatoryFeatureUnsupported rc: 25 traceback: no
         Unsupported repository feature(s) {}. A newer version of Borg is required to access this repository.
@@ -962,6 +983,8 @@ Errors
         Decompression error: {}
     CorruptPack rc: 93 traceback: no
         {}. Run "borg check --repair" to recover the objects that are still readable.
+    CorruptChunkIndexFragment rc: 94 traceback: no
+        Chunk index fragment {} is corrupt. Run "borg check --repair" to rebuild the chunk index.
 
     Reading a legacy borg 1.x repository (e.g. ``borg transfer --from-borg1``) raises the
     ``LegacyRepository.*`` and ``LegacyRemoteRepository.*`` variants of the repository and RPC
@@ -1006,6 +1029,9 @@ Operations
     - cache.close
 
       Saving the local cache (files cache, chunks index, cache config) at the end of a command.
+    - cache.merge_chunkindex_fragments
+
+      Loading the chunk index by merging the index fragments stored in the repository.
     - cache.build_chunkindex_from_repo
 
       Rebuilding the chunk index by reading all pack file headers from the repository, e.g. when
@@ -1013,9 +1039,12 @@ Operations
       a corrupt index.
     - check.index
     - check.packs
+    - check.salvage_packs
     - check.verify_data
+    - check.remove_defect_chunks
     - check.rebuild_archives
     - check.rebuild_archives_directory
+    - check.verify_written_packs
     - repository.merge_packs
     - compact.analyze_archives
     - compact.compact_packs
